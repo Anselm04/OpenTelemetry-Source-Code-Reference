@@ -1,0 +1,343 @@
+<!-- markdownlint-disable MD004 -->
+# CHANGELOG
+
+All notable changes to this project will be documented in this file.
+
+## Unreleased
+
+### :boom: Breaking Changes
+
+### :rocket: Features
+
+### :bug: Bug Fixes
+
+### :books: Documentation
+
+### :house: Internal
+
+## 1.10.0
+
+### :rocket: Features
+
+* feat(api): integrate the Logs API into `@opentelemetry/api` [#4862](https://github.com/open-telemetry/opentelemetry-js/pull/4862) @hectorhdzg
+* feat(api): add imperative `context.attach()` for setting context across callback boundaries that `with()` cannot wrap. [#6845](https://github.com/open-telemetry/opentelemetry-js/pull/6845) @pichlermarc
+  * `attach()` returns a `Token` whose `dispose()` method restores the previous context. Use `token.dispose()` to detach.
+  * `attach` is an optional method on the `ContextManager` interface; when the active context manager does not implement it, `context.attach()` logs a warning and returns a no-op token.
+* feat(api): add `AnyValue` type (of type `unknown`) and extend `Attributes` type values to use `AnyValue` [#6780](https://github.com/open-telemetry/opentelemetry-js/pull/6780) @trentm
+  * This is part of supporting [OTEP 4485](https://github.com/open-telemetry/opentelemetry-specification/blob/main/oteps/4485-extending-attributes-to-support-complex-values.md#how).
+  * This is a **breaking change for SDK implementations**, in that they may need to support more attribute types for any APIs that accept `Attributes` or `AnyValue`. Implementors should refer to the OTEP 4485 link above for "MUST / SHOULD" requirements for complex attributes handling. See also the [attributes-handling utilities provided by `@opentelemetry/core` to help](https://github.com/open-telemetry/opentelemetry-js/blob/main/packages/opentelemetry-core/src/common/attributes.ts). For example, `cleanSimpleAttributes()` can be used to limit user-provided attributes to the set of value types supported in earlier `@opentelemetry/api` versions.
+  * This change is **typically not a breaking change for users** of `@opentelemetry/api`. There is one possible breaking case: If a TypeScript user was using the `Attributes` type in their own code and using [TypeScript Narrowing](https://www.typescriptlang.org/docs/handbook/2/narrowing.html) to reduce an attribute value to an expected type ([example here](https://github.com/open-telemetry/opentelemetry-js/pull/6579#issuecomment-4345316200)). It is expected that this usage should be rare and, likely, limited to SDK implementations, if at all. (If this impacted your code, [please let us know](https://github.com/open-telemetry/opentelemetry-js/issues/new).)
+  * **Note for users of attributes:** Simple attributes SHOULD be used whenever possible. Instrumentations SHOULD assume that backends do not index individual properties of complex attributes, that querying or aggregating on such properties is inefficient and complicated, and that reporting complex attributes carries higher performance overhead.
+
+### :bug: Bug Fixes
+
+* fix(api): cap tracestate list-members and total length in the deprecated `TraceState.set()` so it stays in step with `TraceState` from `@opentelemetry/core` [#6964](https://github.com/open-telemetry/opentelemetry-js/pull/6964) @Zuhef
+* fix: resolve the ESM build through the `default` export condition instead of `import`, so a resolver that activates neither `import` nor `require` still finds an entry point [#7132](https://github.com/open-telemetry/opentelemetry-js/pull/7132) @overbalance
+
+### :books: Documentation
+
+* docs(api): complete `@since` annotations for the public API [#7023](https://github.com/open-telemetry/opentelemetry-js/pull/7023) @nabeelamjadsheikh
+  * Adds the three missing exported-type annotations and the member-level annotations for methods and properties introduced after their enclosing type.
+  * Corrects `Attributes`, `AttributeValue` and `TracerOptions` from `1.3.0` to `1.1.0`; all three were already importable in 1.1.0 via wildcard re-export.
+
+### :house: Internal
+
+* build: migrate the package build from `tsc` to `tsdown`, emitting dual CJS/ESM output from a single `dist/` directory [#6293](https://github.com/open-telemetry/opentelemetry-js/pull/6293) @overbalance
+  * The public entry points are unchanged: `@opentelemetry/api` and `@opentelemetry/api/experimental`. This package already declared an `exports` map, so deep imports such as `@opentelemetry/api/build/src/...` were rejected before this change and continue to be.
+  * The emitted files moved out of `build/src` (CJS), `build/esm` and `build/esnext` (ESM) into `dist/`, using `.cjs`/`.mjs` extensions with matching `.d.cts`/`.d.mts` declarations. The non-standard `esnext` condition has been dropped in favour of the standard `import`/`require` conditions.
+* perf(api): add getGlobal fast-path [#6956](https://github.com/open-telemetry/opentelemetry-js/pull/6956) @legendecas
+* chore: remove the redundant `module` field from `package.json`; bundlers resolve the ESM build through the `exports` map [#7130](https://github.com/open-telemetry/opentelemetry-js/pull/7130) @overbalance
+
+## 1.9.1
+
+### :bug: (Bug Fix)
+
+* fix(api): prioritize `esnext` export condition as it is more specific [#5458](https://github.com/open-telemetry/opentelemetry-js/pull/5458)
+* fix(api): update diag `consoleLogger` to use original console methods to prevent infinite loop when a console instrumentation is present [#6395](https://github.com/open-telemetry/opentelemetry-js/pull/6395)
+* fix(api): use `Attributes` instead of deprecated `SpanAttributes` in `SpanOptions` [#6478](https://github.com/open-telemetry/opentelemetry-js/pull/6478) @overbalance
+* fix(diag): change types in `DiagComponentLogger` from `any` to `unknown`[#5478](https://github.com/open-telemetry/opentelemetry-js/pull/5478) @loganrosen
+* fix(api): re-introduce fallback chain for global utils [#6523](https://github.com/open-telemetry/opentelemetry-js/pull/6523/) @pichlermarc
+
+### :house: (Internal)
+
+* refactor(api): refactor to avoid circular deps by merging observable types into `Metric.ts` [#6441](https://github.com/open-telemetry/opentelemetry-js/pull/6441) @pichlermarc
+* refactor(api): remove "export *" in favor of explicit named exports [#4880](https://github.com/open-telemetry/opentelemetry-js/pull/4880) @robbkidd
+* chore: enable tsconfig isolatedModules [#5697](https://github.com/open-telemetry/opentelemetry-js/pull/5697) @legendecas
+* chore: disallow constructor parameter property syntax [#6187](https://github.com/open-telemetry/opentelemetry-js/pull/6187) @legendecas
+* refactor(api): remove platform-specific globalThis, use globalThis directly [#6208](https://github.com/open-telemetry/opentelemetry-js/pull/6208) @overbalance
+* chore(api): mark ProxyTracerProvider as deprecated [#6328](https://github.com/open-telemetry/opentelemetry-js/pull/6328) @cjihrig
+* chore: enforce `import type` for type-only imports via ESLint [#6467](https://github.com/open-telemetry/opentelemetry-js/pull/6467) @overbalance
+* perf(api): improve isValidSpanId, isValidTraceId performance [#5714](https://github.com/open-telemetry/opentelemetry-js/pull/5714) @seemk
+
+## 1.9.0
+
+### :rocket: (Enhancement)
+
+* feat(metrics): added synchronous gauge [#4528](https://github.com/open-telemetry/opentelemetry-js/pull/4528) @clintonb
+* feat(api): allow adding span links after span creation [#4536](https://github.com/open-telemetry/opentelemetry-js/pull/4536) @seemk
+  * This change is non-breaking for end-users, but breaking for Trace SDK implementations in accordance with the [specification](https://github.com/open-telemetry/opentelemetry-specification/blob/a03382ada8afa9415266a84dafac0510ec8c160f/specification/upgrading.md?plain=1#L97-L122) as new features need to be implemented.
+* feat: support node 22 [#4666](https://github.com/open-telemetry/opentelemetry-js/pull/4666) @dyladan
+
+## 1.8.0
+
+### :rocket: (Enhancement)
+
+* feat(api): add SugaredTracer for functions not defined in the spec
+
+### :bug: (Bug Fix)
+
+* fix(api): fix unreachable @opentelemetry/api/experimental entry [#4446](https://github.com/open-telemetry/opentelemetry-js/pull/4446) @legendecas
+
+## 1.7.0
+
+### :rocket: (Enhancement)
+
+* feat(metrics): prototype experimental advice support [#3876](https://github.com/open-telemetry/opentelemetry-js/pull/3876) @legendecas
+* feat(api): publish api esnext target [#4231](https://github.com/open-telemetry/opentelemetry-js/pull/4231) @legendecas
+
+## 1.6.0
+
+### :bug: (Bug Fix)
+
+* Revert "feat(api): add attributes argument to recordException API [#4071](https://github.com/open-telemetry/opentelemetry-js/pull/4071)"
+  * This feature was an unintentional breaking change introduced with 1.5.0
+
+## 1.5.0
+
+### :rocket: (Enhancement)
+
+* feat(api): add attributes argument to recordException API [#4071](https://github.com/open-telemetry/opentelemetry-js/pull/4071)
+
+## 1.4.1
+
+### :bug: (Bug Fix)
+
+* fix(metrics): export `MetricsAPI` type [#3535](https://github.com/open-telemetry/opentelemetry-js/pull/3535)
+* fix(api): rename `LoggerOptions` to `DiagLoggerOptions` [#3641](https://github.com/open-telemetry/opentelemetry-js/pull/3641)
+* fix(api): export `DiagLoggerOptions` type [#3639](https://github.com/open-telemetry/opentelemetry-js/pull/3639)
+
+## 1.4.0
+
+### :rocket: (Enhancement)
+
+* feat(api): add `getActiveBaggage` API [#3385](https://github.com/open-telemetry/opentelemetry-js/pull/3385)
+* feat(api): add optional `droppedAttributesCount` property in the `Link` interface [#3576](https://github.com/open-telemetry/opentelemetry-js/pull/3576) @mohitk05
+
+### :bug: (Bug Fix)
+
+* fix(api): deprecate MetricAttributes and MetricAttributeValue [#3406](https://github.com/open-telemetry/opentelemetry-js/pull/3406) @blumamir
+* fix(api): use active context as default in NoopTracer [#3476](https://github.com/open-telemetry/opentelemetry-js/pull/3476) @flarna
+* fix(api): declare this parameter type in observable callbacks [#3497](https://github.com/open-telemetry/opentelemetry-js/pull/3497) @legendecas
+
+### :house: (Internal)
+
+* test(api): disable module concatenation in tree-shaking test [#3409](https://github.com/open-telemetry/opentelemetry-js/pull/3409) @legendecas
+
+## [1.3.0](https://www.github.com/open-telemetry/opentelemetry-js-api/compare/v1.2.0...v1.3.0)
+
+* feat(api): merge api-metrics into api [#3374](https://github.com/open-telemetry/opentelemetry-js/pull/3374) @legendecas
+* Optionally suppress warning about logger being overwritten ([#3366](https://www.github.com/open-telemetry/opentelemetry-js-api/pull/3366))
+
+## [1.2.0](https://www.github.com/open-telemetry/opentelemetry-js-api/compare/v1.1.0...v1.2.0) (2022-08-09)
+
+### Features
+
+* Add getActiveSpan to trace API ([#163](https://www.github.com/open-telemetry/opentelemetry-js-api/issues/163)) ([17ccb3a](https://www.github.com/open-telemetry/opentelemetry-js-api/commit/17ccb3a4e385bc5769ded6fc742c9782a93244a5))
+* deprecate Sampler ([#166](https://www.github.com/open-telemetry/opentelemetry-js-api/issues/166)) ([313b2e2](https://www.github.com/open-telemetry/opentelemetry-js-api/commit/313b2e2225f246a6a9518ec4da6942f7d61babce))
+
+## [1.1.0](https://www.github.com/open-telemetry/opentelemetry-js-api/compare/v1.0.4...v1.1.0) (2022-01-25)
+
+### Features
+
+* add tracestate implementation to api ([#147](https://www.github.com/open-telemetry/opentelemetry-js-api/issues/147)) ([82842c7](https://www.github.com/open-telemetry/opentelemetry-js-api/commit/82842c7097614e6ece99e73838ac5e94ff5460b7))
+* define common attributes type ([#142](https://www.github.com/open-telemetry/opentelemetry-js-api/issues/142)) ([ae9bead](https://www.github.com/open-telemetry/opentelemetry-js-api/commit/ae9bead17750d35dec4b63cfae098087666abc85))
+* **trace:** add optional schema url to TracerProvider.getTracer ([#129](https://www.github.com/open-telemetry/opentelemetry-js-api/issues/129)) ([aa65fc6](https://www.github.com/open-telemetry/opentelemetry-js-api/commit/aa65fc66809d45090d6e4951c265386d17ccc6f6))
+
+### Bug Fixes
+
+* export tracer options ([#154](https://www.github.com/open-telemetry/opentelemetry-js-api/issues/154)) ([b125324](https://www.github.com/open-telemetry/opentelemetry-js-api/commit/b125324438fb2f24eb80c7c6673afc8cfc99575e))
+
+## [1.0.4](https://www.github.com/open-telemetry/opentelemetry-js-api/compare/v1.0.3...v1.0.4) (2021-12-18)
+
+### Bug Fixes
+
+* align globalThis fallbacks with otel-core ([#126](https://www.github.com/open-telemetry/opentelemetry-js-api/issues/126)) ([3507de7](https://www.github.com/open-telemetry/opentelemetry-js-api/commit/3507de7c3b95396696657c021953b0b24a63a029))
+
+## [1.0.3](https://www.github.com/open-telemetry/opentelemetry-js-api/compare/v1.0.2...v1.0.3) (2021-08-30)
+
+### Bug Fixes
+
+* remove all circular dependencies ([#119](https://www.github.com/open-telemetry/opentelemetry-js-api/issues/119)) ([a8083e8](https://www.github.com/open-telemetry/opentelemetry-js-api/commit/a8083e84b23227828745da80fd5fe512357dd34b))
+
+## 1.0.2
+
+### :bug: Bug Fix
+
+* [#105](https://github.com/open-telemetry/opentelemetry-js-api/pull/105) fix: set delegate after successful registration ([@Flarna](https://github.com/Flarna))
+* [#94](https://github.com/open-telemetry/opentelemetry-js-api/pull/94) fix: enforce strict equality on prerelease versions ([@dyladan](https://github.com/dyladan))
+
+### :memo: Documentation
+
+* [#106](https://github.com/open-telemetry/opentelemetry-js-api/pull/106) docs: fix crash in README example ([@trentm](https://github.com/trentm))
+* [#101](https://github.com/open-telemetry/opentelemetry-js-api/pull/101) docs: Format example for tracer.startActiveSpan ([@ad-m](https://github.com/ad-m))
+* [#99](https://github.com/open-telemetry/opentelemetry-js-api/pull/99) chore: fix link to API docs ([@dyladan](https://github.com/dyladan))
+
+### :house: Internal
+
+* [#109](https://github.com/open-telemetry/opentelemetry-js-api/pull/109) internal: add missing approvers from core ([@dyladan](https://github.com/dyladan))
+* [#103](https://github.com/open-telemetry/opentelemetry-js-api/pull/103) chore: reuse NoopTracer in ProxyTracer ([@Flarna](https://github.com/Flarna))
+
+### Committers: 4
+
+* Adam Dobrawy ([@ad-m](https://github.com/ad-m))
+* Daniel Dyla ([@dyladan](https://github.com/dyladan))
+* Gerhard Stöbich ([@Flarna](https://github.com/Flarna))
+* Trent Mick ([@trentm](https://github.com/trentm))
+
+## 1.0.1
+
+### :bug: Bug Fix
+
+* [#96](https://github.com/open-telemetry/opentelemetry-js-api/pull/96) chore: remove circular dependency ([@dyladan](https://github.com/dyladan))
+
+### Committers: 1
+
+* Daniel Dyla ([@dyladan](https://github.com/dyladan))
+
+## 1.0.0
+
+### :memo: Documentation
+
+* [#89](https://github.com/open-telemetry/opentelemetry-js-api/pull/89) chore: update upgrade guidelines ([@dyladan](https://github.com/dyladan))
+
+### :house: Internal
+
+* [#90](https://github.com/open-telemetry/opentelemetry-js-api/pull/90) chore: enable typescript 4.3 noImplicitOverride option ([@Flarna](https://github.com/Flarna))
+
+### Committers: 2
+
+* Daniel Dyla ([@dyladan](https://github.com/dyladan))
+* Gerhard Stöbich ([@Flarna](https://github.com/Flarna))
+
+## 0.21.0
+
+### :boom: Breaking Change
+
+* [#78](https://github.com/open-telemetry/opentelemetry-js-api/pull/78) feat: unify signatures of `with` and `bind` ([@Rauno56](https://github.com/Rauno56))
+* [#46](https://github.com/open-telemetry/opentelemetry-js-api/pull/46) chore: do not export singletons ([@dyladan](https://github.com/dyladan))
+
+### :rocket: Enhancement
+
+* [#81](https://github.com/open-telemetry/opentelemetry-js-api/pull/81) chore: function overloads implementation of startActiveSpan in noop t… ([@naseemkullah](https://github.com/naseemkullah))
+
+### :house: Internal
+
+* [#84](https://github.com/open-telemetry/opentelemetry-js-api/pull/84) chore: remove unused backwards compatibility folder ([@Flarna](https://github.com/Flarna))
+* [#85](https://github.com/open-telemetry/opentelemetry-js-api/pull/85) chore: add node:16 to the test matrix ([@Rauno56](https://github.com/Rauno56))
+* [#63](https://github.com/open-telemetry/opentelemetry-js-api/pull/63) feat: debug log global registrations and logger overwrites ([@Rauno56](https://github.com/Rauno56))
+* [#75](https://github.com/open-telemetry/opentelemetry-js-api/pull/75) Add CodeQL Security Scan ([@xukaren](https://github.com/xukaren))
+* [#79](https://github.com/open-telemetry/opentelemetry-js-api/pull/79) chore: fix eslint config ([@Rauno56](https://github.com/Rauno56))
+
+### Committers: 5
+
+* Daniel Dyla ([@dyladan](https://github.com/dyladan))
+* Gerhard Stöbich ([@Flarna](https://github.com/Flarna))
+* Karen Xu ([@xukaren](https://github.com/xukaren))
+* Naseem ([@naseemkullah](https://github.com/naseemkullah))
+* Rauno Viskus ([@Rauno56](https://github.com/Rauno56))
+
+## 0.20.0
+
+### :rocket: Enhancement
+
+* [#69](https://github.com/open-telemetry/opentelemetry-js-api/pull/69) feat(context): add utils method to remove keys from context ([@vmarchaud](https://github.com/vmarchaud))
+* [#71](https://github.com/open-telemetry/opentelemetry-js-api/pull/71) chore: export baggage ([@dyladan](https://github.com/dyladan))
+
+### Committers: 2
+
+* Daniel Dyla ([@dyladan](https://github.com/dyladan))
+* Valentin Marchaud ([@vmarchaud](https://github.com/vmarchaud))
+
+## 0.19.0
+
+### :boom: Breaking Change
+
+* [#55](https://github.com/open-telemetry/opentelemetry-js-api/pull/55) chore: move baggage methods in propagation namespace ([@vmarchaud](https://github.com/vmarchaud))
+* [#65](https://github.com/open-telemetry/opentelemetry-js-api/pull/65) chore: remove suppress instrumentation ([@dyladan](https://github.com/dyladan))
+* [#60](https://github.com/open-telemetry/opentelemetry-js-api/pull/60) chore: removing timed event ([@obecny](https://github.com/obecny))
+* [#58](https://github.com/open-telemetry/opentelemetry-js-api/pull/58) chore: use spancontext for link ([@dyladan](https://github.com/dyladan))
+* [#47](https://github.com/open-telemetry/opentelemetry-js-api/pull/47) chore: move span method for context in trace API #40 ([@vmarchaud](https://github.com/vmarchaud))
+* [#45](https://github.com/open-telemetry/opentelemetry-js-api/pull/45) chore: rename `span#context()` to `span#spanContext` ([@dyladan](https://github.com/dyladan))
+* [#43](https://github.com/open-telemetry/opentelemetry-js-api/pull/43) chore: renaming noop span to non recording span ([@obecny](https://github.com/obecny))
+* [#32](https://github.com/open-telemetry/opentelemetry-js-api/pull/32) feat!: return boolean success value from setGlobalXXX methods ([@dyladan](https://github.com/dyladan))
+
+### :rocket: Enhancement
+
+* [#62](https://github.com/open-telemetry/opentelemetry-js-api/pull/62) chore: adding component logger ([@obecny](https://github.com/obecny))
+* [#54](https://github.com/open-telemetry/opentelemetry-js-api/pull/54) feat: add tracer.startActiveSpan() ([@naseemkullah](https://github.com/naseemkullah))
+* [#58](https://github.com/open-telemetry/opentelemetry-js-api/pull/58) chore: use spancontext for link ([@dyladan](https://github.com/dyladan))
+* [#51](https://github.com/open-telemetry/opentelemetry-js-api/pull/51) feat: add function to wrap SpanContext in NonRecordingSpan #49 ([@dyladan](https://github.com/dyladan))
+
+### :memo: Documentation
+
+* [#64](https://github.com/open-telemetry/opentelemetry-js-api/pull/64) chore: document the reason for symbol.for ([@dyladan](https://github.com/dyladan))
+* [#44](https://github.com/open-telemetry/opentelemetry-js-api/pull/44) chore: updating readme headline and fixing links ([@obecny](https://github.com/obecny))
+
+### Committers: 6
+
+* Bartlomiej Obecny ([@obecny](https://github.com/obecny))
+* Daniel Dyla ([@dyladan](https://github.com/dyladan))
+* Gerhard Stöbich ([@Flarna](https://github.com/Flarna))
+* Naseem ([@naseemkullah](https://github.com/naseemkullah))
+* Valentin Marchaud ([@vmarchaud](https://github.com/vmarchaud))
+* t2t2 ([@t2t2](https://github.com/t2t2))
+
+## 1.0.0-rc.0
+
+### :memo: Documentation
+
+* [#20](https://github.com/open-telemetry/opentelemetry-js-api/pull/20) docs: document latest manual tracing ([@dyladan](https://github.com/dyladan))
+* [#18](https://github.com/open-telemetry/opentelemetry-js-api/pull/18) chore: deploy docs on a release ([@dyladan](https://github.com/dyladan))
+* [#19](https://github.com/open-telemetry/opentelemetry-js-api/pull/19) docs: fix readme links ([@dyladan](https://github.com/dyladan))
+
+### Committers: 1
+
+* Daniel Dyla ([@dyladan](https://github.com/dyladan))
+
+## 0.18.1
+
+### :bug: Bug Fix
+
+* [#16](https://github.com/open-telemetry/opentelemetry-js-api/pull/16) fix: Reverse the direction of the semver check ([@dyladan](https://github.com/dyladan))
+
+### Committers: 1
+
+* Daniel Dyla ([@dyladan](https://github.com/dyladan))
+
+## v0.18.0
+
+### :boom: Breaking Change
+
+* [#9](https://github.com/open-telemetry/opentelemetry-js-api/pull/9) chore: refactor diag logger ([@dyladan](https://github.com/dyladan))
+
+### :rocket: Enhancement
+
+* [#10](https://github.com/open-telemetry/opentelemetry-js-api/pull/10) Use semver to determine API compatibility ([@dyladan](https://github.com/dyladan))
+
+### :house: Internal
+
+* [#12](https://github.com/open-telemetry/opentelemetry-js-api/pull/12) chore: don't disable rule eqeqeq ([@Flarna](https://github.com/Flarna))
+* [#8](https://github.com/open-telemetry/opentelemetry-js-api/pull/8) chore: remove nycrc in favor of tsconfig reporting ([@dyladan](https://github.com/dyladan))
+* [#3](https://github.com/open-telemetry/opentelemetry-js-api/pull/3) chore: add test workflow ([@dyladan](https://github.com/dyladan))
+* [#4](https://github.com/open-telemetry/opentelemetry-js-api/pull/4) chore: remove package lock ([@dyladan](https://github.com/dyladan))
+* [#2](https://github.com/open-telemetry/opentelemetry-js-api/pull/2) chore: add lint workflow ([@dyladan](https://github.com/dyladan))
+
+### Committers: 2
+
+* Daniel Dyla ([@dyladan](https://github.com/dyladan))
+* Gerhard Stöbich ([@Flarna](https://github.com/Flarna))
+
+## v0.17.0
+
+Versions previous to `0.18.0` were developed in another repository.
+To see previous changelog entries see the [CHANGELOG.md](https://github.com/open-telemetry/opentelemetry-js/blob/main/CHANGELOG.md).

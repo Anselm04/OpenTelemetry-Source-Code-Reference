@@ -1,0 +1,1051 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import type {
+  HrTime,
+  Span,
+  SpanOptions,
+  SpanStatus,
+  Histogram,
+  Attributes,
+} from '@opentelemetry/api';
+import {
+  context,
+  INVALID_SPAN_CONTEXT,
+  propagation,
+  ROOT_CONTEXT,
+  SpanKind,
+  SpanStatusCode,
+  trace,
+  ValueType,
+} from '@opentelemetry/api';
+import type { ConfigProvider } from '@opentelemetry/api-config';
+import type { RPCMetadata } from '@opentelemetry/core';
+import {
+  hrTime,
+  hrTimeDuration,
+  hrTimeToMilliseconds,
+  suppressTracing,
+  RPCType,
+  setRPCMetadata,
+} from '@opentelemetry/core';
+import type * as http from 'http';
+import type * as https from 'https';
+import type { Socket } from 'net';
+import type * as url from 'url';
+import type { HttpInstrumentationConfig } from './types';
+import { VERSION } from './version';
+import {
+  InstrumentationBase,
+  InstrumentationNodeModuleDefinition,
+  safeExecuteInTheMiddle,
+  readDeclarativeConfig,
+} from '@opentelemetry/instrumentation';
+import { errorMonitor } from 'events';
+import {
+  ATTR_ERROR_TYPE,
+  ATTR_HTTP_REQUEST_METHOD,
+  ATTR_HTTP_RESPONSE_STATUS_CODE,
+  ATTR_NETWORK_PROTOCOL_VERSION,
+  ATTR_HTTP_ROUTE,
+  ATTR_SERVER_ADDRESS,
+  ATTR_SERVER_PORT,
+  ATTR_URL_SCHEME,
+  METRIC_HTTP_CLIENT_REQUEST_DURATION,
+  METRIC_HTTP_SERVER_REQUEST_DURATION,
+} from '@opentelemetry/semantic-conventions';
+import {
+  extractHostnameAndPort,
+  getIncomingRequestAttributes,
+  getIncomingRequestAttributesOnResponse,
+  getIncomingStableRequestMetricAttributesOnResponse,
+  getOutgoingRequestAttributes,
+  getOutgoingRequestAttributesOnResponse,
+  getOutgoingStableRequestMetricAttributesOnResponse,
+  getRequestInfo,
+  isURLLike,
+  headerCapture,
+  isValidOptionsType,
+  parseErrorType,
+  parseResponseStatus,
+  setSpanWithError,
+} from './utils';
+import type { Err, Func, Http, HttpRequestArgs, Https } from './internal-types';
+import { DEFAULT_QUERY_STRINGS_TO_REDACT } from './internal-types';
+
+/**
+ * `node:http` and `node:https` instrumentation for OpenTelemetry
+ */
+export class HttpInstrumentation extends InstrumentationBase<HttpInstrumentationConfig> {
+  /** keep track on spans not ended */
+  private readonly _spanNotEnded: WeakSet<Span> = new WeakSet<Span>();
+  private _headerCapture;
+  private _httpPatched: boolean = false;
+  private _httpsPatched: boolean = false;
+  declare private _httpServerDurationHistogram: Histogram;
+  declare private _httpClientDurationHistogram: Histogram;
+
+  constructor(config: HttpInstrumentationConfig = {}) {
+    super('@opentelemetry/instrumentation-http', VERSION, config);
+
+    this._headerCapture = this._createHeaderCapture();
+  }
+
+  protected override _updateMetricInstruments() {
+    this._httpServerDurationHistogram = this.meter.createHistogram(
+      METRIC_HTTP_SERVER_REQUEST_DURATION,
+      {
+        description: 'Duration of HTTP server requests.',
+        unit: 's',
+        valueType: ValueType.DOUBLE,
+        advice: {
+          explicitBucketBoundaries: [
+            0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5,
+            7.5, 10,
+          ],
+        },
+      }
+    );
+    this._httpClientDurationHistogram = this.meter.createHistogram(
+      METRIC_HTTP_CLIENT_REQUEST_DURATION,
+      {
+        description: 'Duration of HTTP client requests.',
+        unit: 's',
+        valueType: ValueType.DOUBLE,
+        advice: {
+          explicitBucketBoundaries: [
+            0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5,
+            7.5, 10,
+          ],
+        },
+      }
+    );
+  }
+
+  private _recordServerDuration(durationMs: number, attributes: Attributes) {
+    // stable histogram is counted in S
+    this._httpServerDurationHistogram.record(durationMs / 1000, attributes);
+  }
+
+  private _recordClientDuration(durationMs: number, attributes: Attributes) {
+    // stable histogram is counted in S
+    this._httpClientDurationHistogram.record(durationMs / 1000, attributes);
+  }
+
+  override setConfig(config: HttpInstrumentationConfig = {}): void {
+    super.setConfig(config);
+    this._headerCapture = this._createHeaderCapture();
+  }
+
+  /**
+   * Update the current config (rather than fully *replace* it), with any
+   * settings from declarative config. See the "Declarative Configuration"
+   * section of the README for the properties this instrumentation supports.
+   */
+  setConfigProvider(configProvider: ConfigProvider): void {
+    const config = readDeclarativeConfig({
+      configProvider,
+      instrumentationName: this.instrumentationName,
+      // instrumentation-http owns the `general.http` domain.
+      generalDomains: ['http'],
+      currentConfig: this.getConfig() as Record<string, unknown>,
+      diag: this._diag,
+      reader: (own, general): Partial<HttpInstrumentationConfig> => ({
+        disableIncomingRequestInstrumentation: own.getBoolean(
+          'disable_incoming_request_instrumentation'
+        ),
+        disableOutgoingRequestInstrumentation: own.getBoolean(
+          'disable_outgoing_request_instrumentation'
+        ),
+        requireParentforIncomingSpans: own.getBoolean(
+          'require_parent_for_incoming_spans'
+        ),
+        requireParentforOutgoingSpans: own.getBoolean(
+          'require_parent_for_outgoing_spans'
+        ),
+        redactedQueryParams: own.getStringArray('redacted_query_params'),
+        enableSyntheticSourceDetection: own.getBoolean(
+          'enable_synthetic_source_detection'
+        ),
+        headersToSpanAttributes: {
+          client: {
+            requestHeaders: general.getStringArray(
+              'http.client.request_captured_headers'
+            ),
+            responseHeaders: general.getStringArray(
+              'http.client.response_captured_headers'
+            ),
+          },
+          server: {
+            requestHeaders: general.getStringArray(
+              'http.server.request_captured_headers'
+            ),
+            responseHeaders: general.getStringArray(
+              'http.server.response_captured_headers'
+            ),
+          },
+        },
+      }),
+    });
+
+    if (Object.keys(config).length > 0) {
+      this.setConfig({ ...this.getConfig(), ...config });
+    }
+  }
+
+  init(): [
+    InstrumentationNodeModuleDefinition,
+    InstrumentationNodeModuleDefinition,
+  ] {
+    return [this._getHttpsInstrumentation(), this._getHttpInstrumentation()];
+  }
+
+  private _getHttpInstrumentation() {
+    return new InstrumentationNodeModuleDefinition(
+      'http',
+      ['*'],
+      (moduleExports: Http): Http => {
+        // Guard against double-instrumentation, if loaded by both `require`
+        // and `import`.
+        if (this._httpPatched) {
+          return moduleExports;
+        }
+        this._httpPatched = true;
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const isESM = (moduleExports as any)[Symbol.toStringTag] === 'Module';
+
+        if (!this.getConfig().disableOutgoingRequestInstrumentation) {
+          const patchedRequest = this._wrap(
+            moduleExports,
+            'request',
+            this._getPatchOutgoingRequestFunction('http')
+          ) as unknown as Func<http.ClientRequest>;
+          const patchedGet = this._wrap(
+            moduleExports,
+            'get',
+            this._getPatchOutgoingGetFunction(patchedRequest)
+          );
+          if (isESM) {
+            // To handle `import http from 'http'`, which returns the default
+            // export, we need to set `module.default.*`.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (moduleExports as any).default.request = patchedRequest;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (moduleExports as any).default.get = patchedGet;
+          }
+        }
+        if (!this.getConfig().disableIncomingRequestInstrumentation) {
+          this._wrap(
+            moduleExports.Server.prototype,
+            'emit',
+            this._getPatchIncomingRequestFunction('http')
+          );
+        }
+        return moduleExports;
+      },
+      (moduleExports: Http) => {
+        this._httpPatched = false;
+        if (moduleExports === undefined) return;
+
+        if (!this.getConfig().disableOutgoingRequestInstrumentation) {
+          this._unwrap(moduleExports, 'request');
+          this._unwrap(moduleExports, 'get');
+        }
+        if (!this.getConfig().disableIncomingRequestInstrumentation) {
+          this._unwrap(moduleExports.Server.prototype, 'emit');
+        }
+      }
+    );
+  }
+
+  private _getHttpsInstrumentation() {
+    return new InstrumentationNodeModuleDefinition(
+      'https',
+      ['*'],
+      (moduleExports: Https): Https => {
+        // Guard against double-instrumentation, if loaded by both `require`
+        // and `import`.
+        if (this._httpsPatched) {
+          return moduleExports;
+        }
+        this._httpsPatched = true;
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const isESM = (moduleExports as any)[Symbol.toStringTag] === 'Module';
+
+        if (!this.getConfig().disableOutgoingRequestInstrumentation) {
+          const patchedRequest = this._wrap(
+            moduleExports,
+            'request',
+            this._getPatchHttpsOutgoingRequestFunction('https')
+          ) as unknown as Func<http.ClientRequest>;
+          const patchedGet = this._wrap(
+            moduleExports,
+            'get',
+            this._getPatchHttpsOutgoingGetFunction(patchedRequest)
+          );
+          if (isESM) {
+            // To handle `import https from 'https'`, which returns the default
+            // export, we need to set `module.default.*`.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (moduleExports as any).default.request = patchedRequest;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (moduleExports as any).default.get = patchedGet;
+          }
+        }
+        if (!this.getConfig().disableIncomingRequestInstrumentation) {
+          this._wrap(
+            moduleExports.Server.prototype,
+            'emit',
+            this._getPatchIncomingRequestFunction('https')
+          );
+        }
+        return moduleExports;
+      },
+      (moduleExports: Https) => {
+        this._httpsPatched = false;
+        if (moduleExports === undefined) return;
+
+        if (!this.getConfig().disableOutgoingRequestInstrumentation) {
+          this._unwrap(moduleExports, 'request');
+          this._unwrap(moduleExports, 'get');
+        }
+        if (!this.getConfig().disableIncomingRequestInstrumentation) {
+          this._unwrap(moduleExports.Server.prototype, 'emit');
+        }
+      }
+    );
+  }
+
+  /**
+   * Creates spans for incoming requests, restoring spans' context if applied.
+   */
+  private _getPatchIncomingRequestFunction(component: 'http' | 'https') {
+    return (
+      original: (event: string, ...args: unknown[]) => boolean
+    ): ((this: unknown, event: string, ...args: unknown[]) => boolean) => {
+      return this._incomingRequestFunction(component, original);
+    };
+  }
+
+  /**
+   * Creates spans for outgoing requests, sending spans' context for distributed
+   * tracing.
+   */
+  private _getPatchOutgoingRequestFunction(component: 'http' | 'https') {
+    return (original: Func<http.ClientRequest>): Func<http.ClientRequest> => {
+      return this._outgoingRequestFunction(component, original);
+    };
+  }
+
+  private _getPatchOutgoingGetFunction(
+    clientRequest: (
+      options: http.RequestOptions | string | url.URL,
+      ...args: HttpRequestArgs
+    ) => http.ClientRequest
+  ) {
+    return (_original: Func<http.ClientRequest>): Func<http.ClientRequest> => {
+      // Re-implement http.get. This needs to be done (instead of using
+      // getPatchOutgoingRequestFunction to patch it) because we need to
+      // set the trace context header before the returned http.ClientRequest is
+      // ended. The Node.js docs state that the only differences between
+      // request and get are that (1) get defaults to the HTTP GET method and
+      // (2) the returned request object is ended immediately. The former is
+      // already true (at least in supported Node versions up to v10), so we
+      // simply follow the latter. Ref:
+      // https://nodejs.org/dist/latest/docs/api/http.html#http_http_get_options_callback
+      // https://github.com/googleapis/cloud-trace-nodejs/blob/master/src/instrumentations/instrumentation-http.ts#L198
+      return function outgoingGetRequest<
+        T extends http.RequestOptions | string | url.URL,
+      >(options: T, ...args: HttpRequestArgs): http.ClientRequest {
+        const req = clientRequest(options, ...args);
+        req.end();
+        return req;
+      };
+    };
+  }
+
+  /** Patches HTTPS outgoing requests */
+  private _getPatchHttpsOutgoingRequestFunction(component: 'http' | 'https') {
+    return (original: Func<http.ClientRequest>): Func<http.ClientRequest> => {
+      const instrumentation = this;
+      return function httpsOutgoingRequest(
+        options: https.RequestOptions | string | URL,
+        ...args: HttpRequestArgs
+      ): http.ClientRequest {
+        // Makes sure options will have default HTTPS parameters
+        if (
+          component === 'https' &&
+          typeof options === 'object' &&
+          options?.constructor?.name !== 'URL'
+        ) {
+          options = Object.assign({}, options);
+          instrumentation._setDefaultOptions(options);
+        }
+        return instrumentation._getPatchOutgoingRequestFunction(component)(
+          original
+        )(options, ...args);
+      };
+    };
+  }
+
+  private _setDefaultOptions(options: https.RequestOptions) {
+    options.protocol = options.protocol || 'https:';
+    options.port = options.port || 443;
+  }
+
+  /** Patches HTTPS outgoing get requests */
+  private _getPatchHttpsOutgoingGetFunction(
+    clientRequest: (
+      options: http.RequestOptions | string | URL,
+      ...args: HttpRequestArgs
+    ) => http.ClientRequest
+  ) {
+    return (original: Func<http.ClientRequest>): Func<http.ClientRequest> => {
+      const instrumentation = this;
+      return function httpsOutgoingRequest(
+        options: https.RequestOptions | string | URL,
+        ...args: HttpRequestArgs
+      ): http.ClientRequest {
+        return instrumentation._getPatchOutgoingGetFunction(clientRequest)(
+          original
+        )(options, ...args);
+      };
+    };
+  }
+
+  /**
+   * Attach event listeners to a client request to end span and add span attributes.
+   *
+   * @param request The original request object.
+   * @param span representing the current operation
+   * @param startTime representing the start time of the request to calculate duration in Metric
+   * @param metricAttributes metric attributes for the request duration metric
+   */
+  private _traceClientRequest(
+    request: http.ClientRequest,
+    span: Span,
+    startTime: HrTime,
+    metricAttributes: Attributes
+  ): http.ClientRequest {
+    if (this.getConfig().requestHook) {
+      this._callRequestHook(span, request);
+    }
+
+    /**
+     * Determines if the request has errored or the response has ended/errored.
+     */
+    let responseFinished = false;
+
+    /*
+     * User 'response' event listeners can be added before our listener,
+     * force our listener to be the first, so response emitter is bound
+     * before any user listeners are added to it.
+     */
+    request.prependListener(
+      'response',
+      (response: http.IncomingMessage & { aborted?: boolean }) => {
+        this._diag.debug('outgoingRequest on response()');
+        if (request.listenerCount('response') <= 1) {
+          response.resume();
+        }
+        const responseAttributes =
+          getOutgoingRequestAttributesOnResponse(response);
+        span.setAttributes(responseAttributes);
+        metricAttributes = Object.assign(
+          metricAttributes,
+          getOutgoingStableRequestMetricAttributesOnResponse(responseAttributes)
+        );
+
+        if (this.getConfig().responseHook) {
+          this._callResponseHook(span, response);
+        }
+
+        span.setAttributes(
+          this._headerCapture.client.captureRequestHeaders(header =>
+            request.getHeader(header)
+          )
+        );
+        span.setAttributes(
+          this._headerCapture.client.captureResponseHeaders(
+            header => response.headers[header]
+          )
+        );
+
+        context.bind(context.active(), response);
+
+        const endHandler = () => {
+          this._diag.debug('outgoingRequest on end()');
+          if (responseFinished) {
+            return;
+          }
+          responseFinished = true;
+          let status: SpanStatus;
+
+          if (response.aborted && !response.complete) {
+            status = { code: SpanStatusCode.ERROR };
+          } else {
+            // behaves same for new and old semconv
+            status = {
+              code: parseResponseStatus(SpanKind.CLIENT, response.statusCode),
+            };
+            const errorType = parseErrorType(
+              SpanKind.CLIENT,
+              response.statusCode
+            );
+            if (errorType !== undefined) {
+              span.setAttribute(ATTR_ERROR_TYPE, errorType);
+            }
+          }
+
+          span.setStatus(status);
+
+          if (this.getConfig().applyCustomAttributesOnSpan) {
+            safeExecuteInTheMiddle(
+              () =>
+                this.getConfig().applyCustomAttributesOnSpan!(
+                  span,
+                  request,
+                  response
+                ),
+              () => {},
+              true
+            );
+          }
+
+          this._closeHttpSpan(
+            span,
+            SpanKind.CLIENT,
+            startTime,
+            metricAttributes
+          );
+        };
+
+        response.on('end', endHandler);
+        response.on(errorMonitor, (error: Err) => {
+          this._diag.debug('outgoingRequest on error()', error);
+          if (responseFinished) {
+            return;
+          }
+          responseFinished = true;
+          this._onOutgoingRequestError(
+            span,
+            metricAttributes,
+            startTime,
+            error
+          );
+        });
+      }
+    );
+    request.on('close', () => {
+      this._diag.debug('outgoingRequest on request close()');
+      if (request.aborted || responseFinished) {
+        return;
+      }
+      responseFinished = true;
+      this._closeHttpSpan(span, SpanKind.CLIENT, startTime, metricAttributes);
+    });
+    request.on(errorMonitor, (error: Err) => {
+      this._diag.debug('outgoingRequest on request error()', error);
+      if (responseFinished) {
+        return;
+      }
+      responseFinished = true;
+      this._onOutgoingRequestError(span, metricAttributes, startTime, error);
+    });
+
+    this._diag.debug('http.ClientRequest return request');
+    return request;
+  }
+
+  private _incomingRequestFunction(
+    component: 'http' | 'https',
+    original: (event: string, ...args: unknown[]) => boolean
+  ) {
+    const instrumentation = this;
+    return function incomingRequest(
+      this: unknown,
+      event: string,
+      ...args: unknown[]
+    ): boolean {
+      // Only traces request events
+      if (event !== 'request') {
+        return original.apply(this, [event, ...args]);
+      }
+
+      const request = args[0] as http.IncomingMessage;
+      const response = args[1] as http.ServerResponse & { socket: Socket };
+      const method = request.method || 'GET';
+
+      instrumentation._diag.debug(
+        `${component} instrumentation incomingRequest`
+      );
+
+      if (
+        safeExecuteInTheMiddle(
+          () =>
+            instrumentation.getConfig().ignoreIncomingRequestHook?.(request),
+          (e: unknown) => {
+            if (e != null) {
+              instrumentation._diag.error(
+                'caught ignoreIncomingRequestHook error: ',
+                e
+              );
+            }
+          },
+          true
+        )
+      ) {
+        return context.with(suppressTracing(context.active()), () => {
+          context.bind(context.active(), request);
+          context.bind(context.active(), response);
+          return original.apply(this, [event, ...args]);
+        });
+      }
+
+      const headers = request.headers;
+
+      const spanAttributes = getIncomingRequestAttributes(
+        request,
+        {
+          component: component,
+          hookAttributes: instrumentation._callStartSpanHook(
+            request,
+            instrumentation.getConfig().startIncomingSpanHook
+          ),
+          enableSyntheticSourceDetection:
+            instrumentation.getConfig().enableSyntheticSourceDetection || false,
+          redactedQueryParams:
+            instrumentation.getConfig().redactedQueryParamsServer ??
+            Array.from(DEFAULT_QUERY_STRINGS_TO_REDACT),
+        },
+        instrumentation._diag
+      );
+
+      Object.assign(
+        spanAttributes,
+        instrumentation._headerCapture.server.captureRequestHeaders(
+          header => request.headers[header]
+        )
+      );
+
+      const spanOptions: SpanOptions = {
+        kind: SpanKind.SERVER,
+        attributes: spanAttributes,
+      };
+
+      const startTime = hrTime();
+
+      // request method and url.scheme are both required span attributes
+      const metricAttributes: Attributes = {
+        [ATTR_HTTP_REQUEST_METHOD]: spanAttributes[ATTR_HTTP_REQUEST_METHOD],
+        [ATTR_URL_SCHEME]: spanAttributes[ATTR_URL_SCHEME],
+      };
+
+      // recommended if and only if one was sent, same as span recommendation
+      if (spanAttributes[ATTR_NETWORK_PROTOCOL_VERSION]) {
+        metricAttributes[ATTR_NETWORK_PROTOCOL_VERSION] =
+          spanAttributes[ATTR_NETWORK_PROTOCOL_VERSION];
+      }
+
+      const ctx = propagation.extract(ROOT_CONTEXT, headers);
+      const span = instrumentation._startHttpSpan(method, spanOptions, ctx);
+      const rpcMetadata: RPCMetadata = {
+        type: RPCType.HTTP,
+        span,
+      };
+
+      return context.with(
+        setRPCMetadata(trace.setSpan(ctx, span), rpcMetadata),
+        () => {
+          context.bind(context.active(), request);
+          context.bind(context.active(), response);
+
+          if (instrumentation.getConfig().requestHook) {
+            instrumentation._callRequestHook(span, request);
+          }
+          if (instrumentation.getConfig().responseHook) {
+            instrumentation._callResponseHook(span, response);
+          }
+
+          // After 'error', no further events other than 'close' should be emitted.
+          let hasError = false;
+          response.on('close', () => {
+            if (hasError) {
+              return;
+            }
+            instrumentation._onServerResponseFinish(
+              request,
+              response,
+              span,
+              metricAttributes,
+              startTime
+            );
+          });
+          response.on(errorMonitor, (err: Err) => {
+            hasError = true;
+            instrumentation._onServerResponseError(
+              span,
+              metricAttributes,
+              startTime,
+              err
+            );
+          });
+
+          return safeExecuteInTheMiddle(
+            () => original.apply(this, [event, ...args]),
+            error => {
+              if (error) {
+                instrumentation._onServerResponseError(
+                  span,
+                  metricAttributes,
+                  startTime,
+                  error
+                );
+                throw error;
+              }
+            }
+          );
+        }
+      );
+    };
+  }
+
+  private _outgoingRequestFunction(
+    component: 'http' | 'https',
+    original: Func<http.ClientRequest>
+  ): Func<http.ClientRequest> {
+    const instrumentation = this;
+    return function outgoingRequest(
+      this: unknown,
+      options: url.URL | http.RequestOptions | string,
+      ...args: unknown[]
+    ): http.ClientRequest {
+      if (!isValidOptionsType(options)) {
+        return original.apply(this, [options, ...args]);
+      }
+      const extraOptions =
+        typeof args[0] === 'object' &&
+        (typeof options === 'string' || isURLLike(options))
+          ? (args.shift() as http.RequestOptions)
+          : undefined;
+      const { method, invalidUrl, optionsParsed } = getRequestInfo(
+        instrumentation._diag,
+        options,
+        extraOptions
+      );
+
+      if (
+        safeExecuteInTheMiddle(
+          () =>
+            instrumentation
+              .getConfig()
+              .ignoreOutgoingRequestHook?.(optionsParsed),
+          (e: unknown) => {
+            if (e != null) {
+              instrumentation._diag.error(
+                'caught ignoreOutgoingRequestHook error: ',
+                e
+              );
+            }
+          },
+          true
+        )
+      ) {
+        return original.apply(this, [optionsParsed, ...args]);
+      }
+
+      const { hostname, port } = extractHostnameAndPort(optionsParsed);
+      const attributes = getOutgoingRequestAttributes(
+        optionsParsed,
+        {
+          component,
+          port,
+          hostname,
+          hookAttributes: instrumentation._callStartSpanHook(
+            optionsParsed,
+            instrumentation.getConfig().startOutgoingSpanHook
+          ),
+          redactedQueryParams: instrumentation.getConfig().redactedQueryParams, // Added config for adding custom query strings
+        },
+        instrumentation.getConfig().enableSyntheticSourceDetection || false
+      );
+
+      const startTime = hrTime();
+
+      // request method, server address, and server port are both required span attributes
+      const metricAttributes: Attributes = {
+        [ATTR_HTTP_REQUEST_METHOD]: attributes[ATTR_HTTP_REQUEST_METHOD],
+        [ATTR_SERVER_ADDRESS]: attributes[ATTR_SERVER_ADDRESS],
+        [ATTR_SERVER_PORT]: attributes[ATTR_SERVER_PORT],
+      };
+
+      // required if and only if one was sent, same as span requirement
+      if (attributes[ATTR_HTTP_RESPONSE_STATUS_CODE]) {
+        metricAttributes[ATTR_HTTP_RESPONSE_STATUS_CODE] =
+          attributes[ATTR_HTTP_RESPONSE_STATUS_CODE];
+      }
+
+      // recommended if and only if one was sent, same as span recommendation
+      if (attributes[ATTR_NETWORK_PROTOCOL_VERSION]) {
+        metricAttributes[ATTR_NETWORK_PROTOCOL_VERSION] =
+          attributes[ATTR_NETWORK_PROTOCOL_VERSION];
+      }
+
+      const spanOptions: SpanOptions = {
+        kind: SpanKind.CLIENT,
+        attributes,
+      };
+      const span = instrumentation._startHttpSpan(method, spanOptions);
+
+      const parentContext = context.active();
+      const requestContext = trace.setSpan(parentContext, span);
+
+      if (!optionsParsed.headers) {
+        optionsParsed.headers = {};
+      } else {
+        // Make a copy of the headers object to avoid mutating an object the
+        // caller might have a reference to.
+        optionsParsed.headers = Object.assign({}, optionsParsed.headers);
+      }
+      propagation.inject(requestContext, optionsParsed.headers);
+
+      return context.with(requestContext, () => {
+        /*
+         * The response callback is registered before ClientRequest is bound,
+         * thus it is needed to bind it before the function call.
+         */
+        const cb = args[args.length - 1];
+        if (typeof cb === 'function') {
+          args[args.length - 1] = context.bind(parentContext, cb);
+        }
+
+        const request: http.ClientRequest = safeExecuteInTheMiddle(
+          () => {
+            if (invalidUrl) {
+              // we know that the url is invalid, there's no point in injecting context as it will fail validation.
+              // Passing in what the user provided will give the user an error that matches what they'd see without
+              // the instrumentation.
+              return original.apply(this, [options, ...args]);
+            } else {
+              return original.apply(this, [optionsParsed, ...args]);
+            }
+          },
+          error => {
+            if (error) {
+              instrumentation._onOutgoingRequestError(
+                span,
+                metricAttributes,
+                startTime,
+                error
+              );
+              throw error;
+            }
+          }
+        );
+
+        instrumentation._diag.debug(
+          `${component} instrumentation outgoingRequest`
+        );
+        context.bind(parentContext, request);
+        return instrumentation._traceClientRequest(
+          request,
+          span,
+          startTime,
+          metricAttributes
+        );
+      });
+    };
+  }
+
+  private _onServerResponseFinish(
+    request: http.IncomingMessage,
+    response: http.ServerResponse,
+    span: Span,
+    metricAttributes: Attributes,
+    startTime: HrTime
+  ) {
+    const attributes = getIncomingRequestAttributesOnResponse(response);
+    metricAttributes = Object.assign(
+      metricAttributes,
+      getIncomingStableRequestMetricAttributesOnResponse(attributes)
+    );
+
+    span.setAttributes(
+      this._headerCapture.server.captureResponseHeaders(header =>
+        response.getHeader(header)
+      )
+    );
+
+    span.setAttributes(attributes).setStatus({
+      code: parseResponseStatus(SpanKind.SERVER, response.statusCode),
+    });
+
+    const errorType = parseErrorType(SpanKind.SERVER, response.statusCode);
+    if (errorType !== undefined) {
+      span.setAttribute(ATTR_ERROR_TYPE, errorType);
+    }
+
+    const route = attributes[ATTR_HTTP_ROUTE];
+    if (route) {
+      span.updateName(`${request.method || 'GET'} ${route}`);
+    }
+
+    if (this.getConfig().applyCustomAttributesOnSpan) {
+      safeExecuteInTheMiddle(
+        () =>
+          this.getConfig().applyCustomAttributesOnSpan!(
+            span,
+            request,
+            response
+          ),
+        () => {},
+        true
+      );
+    }
+
+    this._closeHttpSpan(span, SpanKind.SERVER, startTime, metricAttributes);
+  }
+
+  private _onOutgoingRequestError(
+    span: Span,
+    metricAttributes: Attributes,
+    startTime: HrTime,
+    error: Err
+  ) {
+    setSpanWithError(span, error);
+    metricAttributes[ATTR_ERROR_TYPE] = error.name;
+
+    this._closeHttpSpan(span, SpanKind.CLIENT, startTime, metricAttributes);
+  }
+
+  private _onServerResponseError(
+    span: Span,
+    metricAttributes: Attributes,
+    startTime: HrTime,
+    error: Err
+  ) {
+    setSpanWithError(span, error);
+    metricAttributes[ATTR_ERROR_TYPE] = error.name;
+
+    this._closeHttpSpan(span, SpanKind.SERVER, startTime, metricAttributes);
+  }
+
+  private _startHttpSpan(
+    name: string,
+    options: SpanOptions,
+    ctx = context.active()
+  ) {
+    /*
+     * If a parent is required but not present, we use a `NoopSpan` to still
+     * propagate context without recording it.
+     */
+    const requireParent =
+      options.kind === SpanKind.CLIENT
+        ? this.getConfig().requireParentforOutgoingSpans
+        : this.getConfig().requireParentforIncomingSpans;
+
+    let span: Span;
+    const currentSpan = trace.getSpan(ctx);
+
+    if (
+      requireParent === true &&
+      (!currentSpan || !trace.isSpanContextValid(currentSpan.spanContext()))
+    ) {
+      span = trace.wrapSpanContext(INVALID_SPAN_CONTEXT);
+    } else if (requireParent === true && currentSpan?.spanContext().isRemote) {
+      span = currentSpan;
+    } else {
+      span = this.tracer.startSpan(name, options, ctx);
+    }
+    this._spanNotEnded.add(span);
+    return span;
+  }
+
+  private _closeHttpSpan(
+    span: Span,
+    spanKind: SpanKind,
+    startTime: HrTime,
+    metricAttributes: Attributes
+  ) {
+    if (!this._spanNotEnded.has(span)) {
+      return;
+    }
+
+    span.end();
+    this._spanNotEnded.delete(span);
+
+    // Record metrics
+    const duration = hrTimeToMilliseconds(hrTimeDuration(startTime, hrTime()));
+    if (spanKind === SpanKind.SERVER) {
+      this._recordServerDuration(duration, metricAttributes);
+    } else if (spanKind === SpanKind.CLIENT) {
+      this._recordClientDuration(duration, metricAttributes);
+    }
+  }
+
+  private _callResponseHook(
+    span: Span,
+    response: http.IncomingMessage | http.ServerResponse
+  ) {
+    safeExecuteInTheMiddle(
+      () => this.getConfig().responseHook!(span, response),
+      () => {},
+      true
+    );
+  }
+
+  private _callRequestHook(
+    span: Span,
+    request: http.ClientRequest | http.IncomingMessage
+  ) {
+    safeExecuteInTheMiddle(
+      () => this.getConfig().requestHook!(span, request),
+      () => {},
+      true
+    );
+  }
+
+  private _callStartSpanHook(
+    request: http.IncomingMessage | http.RequestOptions,
+    hookFunc: Function | undefined
+  ) {
+    if (typeof hookFunc === 'function') {
+      return safeExecuteInTheMiddle(
+        () => hookFunc(request),
+        () => {},
+        true
+      );
+    }
+  }
+
+  private _createHeaderCapture() {
+    const config = this.getConfig();
+
+    return {
+      client: {
+        captureRequestHeaders: headerCapture(
+          'request',
+          config.headersToSpanAttributes?.client?.requestHeaders ?? []
+        ),
+        captureResponseHeaders: headerCapture(
+          'response',
+          config.headersToSpanAttributes?.client?.responseHeaders ?? []
+        ),
+      },
+      server: {
+        captureRequestHeaders: headerCapture(
+          'request',
+          config.headersToSpanAttributes?.server?.requestHeaders ?? []
+        ),
+        captureResponseHeaders: headerCapture(
+          'response',
+          config.headersToSpanAttributes?.server?.responseHeaders ?? []
+        ),
+      },
+    };
+  }
+}

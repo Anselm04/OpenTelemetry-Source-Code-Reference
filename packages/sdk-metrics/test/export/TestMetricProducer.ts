@@ -1,0 +1,36 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import type {
+  CollectionResult,
+  ResourceMetrics,
+} from '../../src/export/MetricData';
+import type { MetricProducer } from '../../src/export/MetricProducer';
+import { testResource } from '../util';
+
+export const emptyResourceMetrics: ResourceMetrics = {
+  resource: testResource,
+  scopeMetrics: [],
+};
+
+export class TestMetricProducer implements MetricProducer {
+  private resourceMetrics: ResourceMetrics;
+  private errors: unknown[];
+
+  constructor(params?: {
+    resourceMetrics?: ResourceMetrics;
+    errors?: unknown[];
+  }) {
+    this.resourceMetrics = params?.resourceMetrics ?? emptyResourceMetrics;
+    this.errors = params?.errors ?? [];
+  }
+
+  async collect(): Promise<CollectionResult> {
+    return {
+      resourceMetrics: this.resourceMetrics,
+      errors: this.errors,
+    };
+  }
+}

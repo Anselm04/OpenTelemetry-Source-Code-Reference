@@ -1,0 +1,30 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": [
+      "es2022",
+      "dom",
+      "dom.iterable"
+    ],
+    "outDir": "build",
+    "rootDir": "."
+  },
+  "include": [
+    "src/**/*.ts",
+    "test/**/*.ts"
+  ],
+  "references": [
+    {
+      "path": "../../../api"
+    },
+    {
+      "path": "../otlp-exporter-base"
+    },
+    {
+      "path": "../otlp-transformer"
+    },
+    {
+      "path": "../../../packages/sdk-logs"
+    }
+  ]
+}

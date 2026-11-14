@@ -1,0 +1,36 @@
+{
+  "name": "@opentelemetry/integration-tests-api",
+  "version": "2.10.0",
+  "private": true,
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "description": "Verifies @opentelemetry/api in integration tests",
+  "author": "OpenTelemetry Authors",
+  "homepage": "https://github.com/open-telemetry/opentelemetry-js/tree/main/integration-tests/api",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/open-telemetry/opentelemetry-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/open-telemetry/opentelemetry-js/issues"
+  },
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "scripts": {
+    "test": "nyc mocha test/**/*.test.js",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "align-api-deps": "node ../../scripts/align-api-deps.mjs"
+  },
+  "devDependencies": {
+    "@opentelemetry/api": "^1.3.0",
+    "@opentelemetry/core": "3.1.1",
+    "@types/mocha": "10.0.10",
+    "@types/node": "18.19.130",
+    "mocha": "12.0.3",
+    "nyc": "18.0.0"
+  }
+}

@@ -1,0 +1,38 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+import type { ISerializer } from '../../i-serializer';
+import type { ReadableLogRecord } from '@opentelemetry/sdk-logs';
+import { createExportLogsServiceRequest } from '../internal';
+import type { IExportLogsServiceResponse } from '../export-response';
+import { JSON_ENCODER } from '../../common/utils';
+import { diag } from '@opentelemetry/api';
+
+/**
+ * @experimental this serializer may receive breaking changes in minor versions, pin this package's version when using this constant
+ */
+export const JsonLogsSerializer: ISerializer<
+  ReadableLogRecord[],
+  IExportLogsServiceResponse
+> = {
+  serializeRequest: (arg: ReadableLogRecord[]) => {
+    const request = createExportLogsServiceRequest(arg, JSON_ENCODER);
+    const encoder = new TextEncoder();
+    return encoder.encode(JSON.stringify(request));
+  },
+  deserializeResponse: (arg: Uint8Array) => {
+    if (arg.length === 0) {
+      return {};
+    }
+    const decoder = new TextDecoder();
+    try {
+      return JSON.parse(decoder.decode(arg)) as IExportLogsServiceResponse;
+    } catch (err) {
+      diag.warn(
+        `Failed to parse logs export response: ${err.message}. Returning empty response`
+      );
+      return {};
+    }
+  },
+};

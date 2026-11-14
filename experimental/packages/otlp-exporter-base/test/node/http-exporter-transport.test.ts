@@ -1,0 +1,628 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import { createHttpExporterTransport } from '../../src/platform/node/transport/http-exporter-transport';
+import { MAX_RESPONSE_BODY_SIZE } from '../../src/platform/node/transport/http-transport-utils';
+import * as http from 'http';
+import * as assert from 'assert';
+import * as sinon from 'sinon';
+import type {
+  ExportResponseRetryable,
+  ExportResponseFailure,
+  ExportResponseSuccess,
+  OTLPExporterError,
+} from '../../src';
+import * as zlib from 'zlib';
+import type { TcpNetConnectOpts } from 'net';
+import { createConnection } from 'net';
+
+const sampleRequestData = new Uint8Array([1, 2, 3]);
+
+describe('HttpExporterTransport', function () {
+  describe('send', function () {
+    let server: http.Server | undefined;
+
+    afterEach(function (done) {
+      sinon.restore();
+      if (server != null) {
+        server.close(done);
+        server = undefined;
+      } else {
+        server = undefined;
+        done();
+      }
+    });
+
+    it('returns success on success status', async function () {
+      // arrange
+      const expectedResponseData = Buffer.from([4, 5, 6]);
+      server = http.createServer((_, res) => {
+        res.statusCode = 200;
+        res.write(expectedResponseData);
+        res.end();
+      });
+      server.listen(8080);
+
+      const transport = createHttpExporterTransport({
+        url: 'http://localhost:8080',
+        headers: async () => ({}),
+        compression: 'none',
+        agentFactory: () => new http.Agent(),
+      });
+
+      // act
+      const result = await transport.send(sampleRequestData, 1000);
+
+      // assert
+      assert.strictEqual(result.status, 'success');
+      assert.deepEqual(
+        (result as ExportResponseSuccess).data,
+        expectedResponseData
+      );
+    });
+
+    it('returns success on success status with custom agent', async function () {
+      // arrange
+      const expectedResponseData = Buffer.from([4, 5, 6]);
+      server = http.createServer((_, res) => {
+        res.statusCode = 200;
+        res.write(expectedResponseData);
+        res.end();
+      });
+      server.listen(8080);
+
+      class SedAgent extends http.Agent {
+        override createConnection(
+          options: TcpNetConnectOpts,
+          listener: () => void
+        ) {
+          return createConnection(
+            { ...options, host: options.host?.replaceAll('j', 'l') },
+            listener
+          );
+        }
+      }
+
+      const transport = createHttpExporterTransport({
+        url: 'http://jocajhost:8080',
+        headers: async () => ({}),
+        compression: 'none',
+        agentFactory: protocol => {
+          assert.strictEqual(protocol, 'http:');
+          return new SedAgent();
+        },
+      });
+
+      // act
+      const result = await transport.send(sampleRequestData, 1000);
+
+      // assert
+      assert.strictEqual(result.status, 'success');
+      assert.deepEqual(
+        (result as ExportResponseSuccess).data,
+        expectedResponseData
+      );
+    });
+
+    it('returns success when sending to IPv6 localhost address', async function () {
+      // arrange
+      const expectedResponseData = Buffer.from([4, 5, 6]);
+      server = http.createServer((_, res) => {
+        res.statusCode = 200;
+        res.write(expectedResponseData);
+        res.end();
+      });
+
+      // Listen on IPv6 localhost - skip test if IPv6 is not available
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server!.listen(0, '::1', () => resolve());
+          server!.once('error', reject);
+        });
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code === 'EADDRNOTAVAIL') {
+          this.skip();
+        }
+        throw err;
+      }
+      const port = (server!.address() as any).port;
+
+      const transport = createHttpExporterTransport({
+        url: `http://[::1]:${port}`,
+        headers: async () => ({}),
+        compression: 'none',
+        agentFactory: () => new http.Agent(),
+      });
+
+      // act
+      const result = await transport.send(sampleRequestData, 1000);
+
+      // assert
+      assert.strictEqual(result.status, 'success');
+      assert.deepEqual(
+        (result as ExportResponseSuccess).data,
+        expectedResponseData
+      );
+    });
+
+    it('returns retryable on retryable status', async function () {
+      //arrange
+      server = http.createServer((_, res) => {
+        res.statusCode = 503;
+        res.end();
+      });
+      server.listen(8080);
+
+      const transport = createHttpExporterTransport({
+        url: 'http://localhost:8080',
+        headers: async () => ({}),
+        compression: 'none',
+        agentFactory: () => new http.Agent(),
+      });
+
+      // act
+      const result = await transport.send(sampleRequestData, 1000);
+
+      // assert
+      assert.strictEqual(result.status, 'retryable');
+    });
+
+    it('returns retryable on retryable status with retry-after header', async function () {
+      // arrange
+      server = http.createServer((_, res) => {
+        res.statusCode = 429;
+        res.setHeader('retry-after', 1);
+        res.end();
+      });
+      server.listen(8080);
+
+      // act
+      const transport = createHttpExporterTransport({
+        url: 'http://localhost:8080',
+        headers: async () => ({}),
+        compression: 'none',
+        agentFactory: () => new http.Agent(),
+      });
+
+      const result = await transport.send(sampleRequestData, 1000);
+
+      // assert
+      assert.strictEqual(result.status, 'retryable');
+      assert.strictEqual(
+        (result as ExportResponseRetryable).retryInMillis,
+        1000
+      );
+    });
+
+    it('returns failure on non-retryable status', async function () {
+      // arrange
+      server = http.createServer((_, res) => {
+        res.statusCode = 404;
+        res.end('response-body');
+      });
+      server.listen(8080);
+
+      const transport = createHttpExporterTransport({
+        url: 'http://localhost:8080',
+        headers: async () => ({}),
+        compression: 'none',
+        agentFactory: () => new http.Agent(),
+      });
+
+      // act
+      const result = await transport.send(sampleRequestData, 1000);
+
+      // assert
+      assert.strictEqual(result.status, 'failure');
+      assert.strictEqual(
+        (result as ExportResponseFailure).error.message,
+        'Not Found'
+      );
+      assert.strictEqual(
+        ((result as ExportResponseFailure).error as OTLPExporterError).data,
+        'response-body'
+      );
+      assert.strictEqual(
+        ((result as ExportResponseFailure).error as OTLPExporterError).code,
+        404
+      );
+    });
+
+    it('returns retryable when request times out', function (done) {
+      // arrange
+      const timer = sinon.useFakeTimers();
+      server = http.createServer((_, res) => {
+        setTimeout(() => {
+          res.statusCode = 200;
+          res.end();
+        }, 1000);
+      });
+      server.listen(8080);
+
+      const transport = createHttpExporterTransport({
+        url: 'http://localhost:8080',
+        headers: async () => ({}),
+        compression: 'none',
+        agentFactory: () => new http.Agent(),
+      });
+
+      // act
+      transport
+        .send(sampleRequestData, 100)
+        .then(result => {
+          // assert
+          assert.strictEqual(result.status, 'retryable');
+          assert.ok(result.error, 'Expected error object to be present');
+          assert.strictEqual(result.error.message, 'Request timed out');
+          done();
+        })
+        .catch(error => {
+          done(error);
+        });
+      // pass more time than passed as timeout value
+      timer.tick(200);
+    });
+
+    it('returns retryable when socket hangs up (ECONNRESET)', async function () {
+      // arrange
+      server = http.createServer((_, res) => {
+        res.destroy();
+      });
+      server.listen(8080);
+
+      const transport = createHttpExporterTransport({
+        url: 'http://localhost:8080',
+        headers: async () => ({}),
+        compression: 'none',
+        agentFactory: () => new http.Agent(),
+      });
+
+      // act
+      const result = await transport.send(sampleRequestData, 100);
+
+      // assert
+      assert.strictEqual(result.status, 'retryable');
+      assert.ok(result.error, 'Expected error object to be present');
+      assert.strictEqual(
+        (result.error as NodeJS.ErrnoException).code,
+        'ECONNRESET'
+      );
+      assert.strictEqual(result.error?.message, 'socket hang up');
+    });
+
+    it('returns failure when socket is destroyed after headers with non-retryable error code are received', async function () {
+      // arrange
+      server = http.createServer((_, res) => {
+        // Force flush http response headers to trigger client response callback
+        res.writeHead(403);
+        res.write('');
+        // Destroy the socket to simulate something going wrong
+        queueMicrotask(() => {
+          res.socket?.destroy();
+        });
+      });
+      server.listen(8080);
+
+      const transport = createHttpExporterTransport({
+        url: 'http://localhost:8080',
+        headers: async () => ({}),
+        compression: 'none',
+        agentFactory: () => new http.Agent(),
+      });
+
+      // act
+      const result = await transport.send(sampleRequestData, 1000);
+
+      // assert
+      assert.strictEqual(result.status, 'failure');
+      assert.strictEqual(
+        (result.error as NodeJS.ErrnoException).code,
+        'ECONNRESET'
+      );
+      assert.strictEqual(result.error?.message, 'aborted');
+    });
+
+    it('returns failure when socket is destroyed after headers with retryable code are received', async function () {
+      // arrange
+      server = http.createServer((_, res) => {
+        // Force flush http response headers to trigger client response callback
+        res.writeHead(429, 'Too many requests', { 'retry-after': '1' });
+        res.write('');
+        // Destroy the socket to simulate something going wrong
+        queueMicrotask(() => {
+          res.socket?.destroy();
+        });
+      });
+      server.listen(8080);
+
+      const transport = createHttpExporterTransport({
+        url: 'http://localhost:8080',
+        headers: async () => ({}),
+        compression: 'none',
+        agentFactory: () => new http.Agent(),
+      });
+
+      // act
+      const result = await transport.send(sampleRequestData, 1000);
+
+      // assert
+      assert.strictEqual(result.status, 'retryable');
+      assert.strictEqual(
+        (result.error as NodeJS.ErrnoException).code,
+        'ECONNRESET'
+      );
+      assert.strictEqual(result.retryInMillis, 1000);
+      assert.strictEqual(result.error?.message, 'aborted');
+    });
+
+    it('returns success when socket is destroyed after headers with success code are received', async function () {
+      // arrange
+      server = http.createServer((_, res) => {
+        // Force flush http response headers to trigger client response callback
+        res.writeHead(200);
+        res.write('');
+        // Destroy the socket to simulate connection reset after headers
+        queueMicrotask(() => {
+          res.socket?.destroy();
+        });
+      });
+      server.listen(8080);
+
+      const transport = createHttpExporterTransport({
+        url: 'http://localhost:8080',
+        headers: async () => ({}),
+        compression: 'none',
+        agentFactory: () => new http.Agent(),
+      });
+
+      // act
+      const result = await transport.send(sampleRequestData, 1000);
+
+      // assert
+      assert.strictEqual(result.status, 'success');
+    });
+
+    it('returns retryable on connection refused (ECONNREFUSED)', async function () {
+      // arrange
+      server = http.createServer();
+      await new Promise<void>(resolve => server!.listen(0, resolve));
+      const port = (server!.address() as any).port;
+      await new Promise<void>(resolve => server!.close(resolve as any));
+      server = undefined;
+
+      const transport = createHttpExporterTransport({
+        url: `http://localhost:${port}`,
+        headers: async () => ({}),
+        compression: 'none',
+        agentFactory: () => new http.Agent(),
+      });
+
+      // act
+      const result = await transport.send(sampleRequestData, 50);
+
+      // assert
+      assert.strictEqual(result.status, 'retryable');
+      assert.ok(result.error, 'Expected error object to be present');
+      assert.strictEqual(
+        (result.error as NodeJS.ErrnoException).code,
+        'ECONNREFUSED'
+      );
+      // Node.js 20+ can try multiple requests (IPv4 & IPv6) at once
+      // and return AggregateError
+      const errorMessage =
+        result.error instanceof AggregateError
+          ? result.error?.errors.map(e => (e as Error).message).join(' ')
+          : result.error?.message;
+      assert.strictEqual(errorMessage.includes('connect ECONNREFUSED'), true);
+    });
+
+    it('returns retryable when server does not exist (ENOTFOUND)', async function () {
+      // arrange
+      const transport = createHttpExporterTransport({
+        // use wrong port
+        url: 'http://example.test',
+        headers: async () => ({}),
+        compression: 'none',
+        agentFactory: () => new http.Agent(),
+      });
+
+      // act
+      const result = await transport.send(sampleRequestData, 100);
+
+      // assert
+      assert.strictEqual(result.status, 'retryable');
+      assert.ok(result.error, 'Expected error object to be present');
+      assert.strictEqual(
+        (result.error as NodeJS.ErrnoException).code,
+        'ENOTFOUND'
+      );
+      assert.strictEqual(
+        result.error?.message.includes('getaddrinfo ENOTFOUND'),
+        true
+      );
+    });
+
+    it('passes uncompressed input to server', function (done) {
+      // arrange
+      const expectedHeaders = { foo: 'foo-value', bar: 'bar-value' };
+      server = http.createServer((req, res) => {
+        const requestData: Buffer[] = [];
+        req.on('data', chunk => {
+          requestData.push(chunk);
+        });
+
+        req.on('end', () => {
+          try {
+            // assert
+            assert.strictEqual(req.headers.foo, expectedHeaders.foo);
+            assert.strictEqual(req.headers.bar, expectedHeaders.bar);
+            assert.strictEqual(req.headers['content-encoding'], undefined);
+            assert.deepEqual(
+              Buffer.concat(requestData),
+              Buffer.from(sampleRequestData)
+            );
+            done();
+          } catch (e) {
+            // ensure done is called and errors are reported
+            done(e);
+          }
+
+          res.statusCode = 200;
+          res.end();
+        });
+      });
+      server.listen(8080);
+
+      // act
+      const transport = createHttpExporterTransport({
+        url: 'http://localhost:8080',
+        headers: async () => ({ foo: 'foo-value', bar: 'bar-value' }),
+        compression: 'none',
+        agentFactory: () => new http.Agent(),
+      });
+
+      // assert
+      transport.send(sampleRequestData, 100);
+    });
+
+    it('returns success with data when response body is exactly at limit', async function () {
+      // arrange
+      const atLimitData = Buffer.alloc(MAX_RESPONSE_BODY_SIZE);
+      server = http.createServer((_, res) => {
+        res.statusCode = 200;
+        res.write(atLimitData);
+        res.end();
+      });
+      server.listen(8080);
+
+      const transport = createHttpExporterTransport({
+        url: 'http://localhost:8080',
+        headers: async () => ({}),
+        compression: 'none',
+        agentFactory: () => new http.Agent(),
+      });
+
+      // act
+      const result = await transport.send(sampleRequestData, 10000);
+
+      // assert
+      assert.strictEqual(result.status, 'success');
+      assert.deepEqual((result as ExportResponseSuccess).data, atLimitData);
+    });
+
+    it('returns failure when 2xx response body exceeds limit', async function () {
+      // arrange
+      const oversizeData = Buffer.alloc(MAX_RESPONSE_BODY_SIZE + 1);
+      server = http.createServer((_, res) => {
+        res.statusCode = 200;
+        res.write(oversizeData);
+        res.end();
+      });
+      server.listen(8080);
+
+      const transport = createHttpExporterTransport({
+        url: 'http://localhost:8080',
+        headers: async () => ({}),
+        compression: 'none',
+        agentFactory: () => new http.Agent(),
+      });
+
+      // act
+      const result = await transport.send(sampleRequestData, 10000);
+
+      // assert: per spec, oversized response is always a non-retryable error
+      assert.strictEqual(result.status, 'failure');
+      assert.ok(
+        (result as ExportResponseFailure).error,
+        'Expected error to be present'
+      );
+      assert.ok(
+        (result as ExportResponseFailure).error.message.includes('size limit'),
+        'Expected error message to mention size limit'
+      );
+    });
+
+    it('returns failure when non-2xx response body exceeds limit', async function () {
+      // arrange
+      const oversizeData = Buffer.alloc(MAX_RESPONSE_BODY_SIZE + 1);
+      server = http.createServer((_, res) => {
+        res.statusCode = 503;
+        res.write(oversizeData);
+        res.end();
+      });
+      server.listen(8080);
+
+      const transport = createHttpExporterTransport({
+        url: 'http://localhost:8080',
+        headers: async () => ({}),
+        compression: 'none',
+        agentFactory: () => new http.Agent(),
+      });
+
+      // act
+      const result = await transport.send(sampleRequestData, 10000);
+
+      // assert: oversized response from misbehaving server is non-retryable
+      assert.strictEqual(result.status, 'failure');
+      assert.ok(
+        (result as ExportResponseFailure).error,
+        'Expected error to be present'
+      );
+      assert.ok(
+        (result as ExportResponseFailure).error.message.includes('size limit'),
+        'Expected error message to mention size limit'
+      );
+    });
+
+    it('passes gzip compressed input to server', function (done) {
+      // arrange
+      const expectedHeaders = { foo: 'foo-value', bar: 'bar-value' };
+      server = http.createServer((req, res) => {
+        const requestData: Buffer[] = [];
+        req.on('data', chunk => {
+          requestData.push(chunk);
+        });
+
+        req.on('end', () => {
+          try {
+            // assert
+            assert.strictEqual(req.headers.foo, expectedHeaders.foo);
+            assert.strictEqual(req.headers.bar, expectedHeaders.bar);
+            assert.strictEqual(req.headers['content-encoding'], 'gzip');
+            zlib.unzip(Buffer.concat(requestData), (error, result) => {
+              if (error != null) {
+                done(error);
+              }
+              try {
+                assert.deepEqual(result, Buffer.from(sampleRequestData));
+                done();
+              } catch (e) {
+                // ensure done is called and errors are reported
+                done(e);
+              }
+            });
+          } catch (e) {
+            // ensure done is called and errors are reported
+            done(e);
+          }
+
+          res.statusCode = 200;
+          res.end();
+        });
+      });
+      server.listen(8080);
+
+      const transport = createHttpExporterTransport({
+        url: 'http://localhost:8080',
+        headers: async () => ({ foo: 'foo-value', bar: 'bar-value' }),
+        compression: 'gzip',
+        agentFactory: () => new http.Agent(),
+      });
+
+      // act
+      transport.send(sampleRequestData, 100);
+    });
+  });
+});

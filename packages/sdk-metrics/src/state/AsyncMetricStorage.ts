@@ -1,0 +1,85 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import type { HrTime } from '@opentelemetry/api';
+import type { Accumulation, Aggregator } from '../aggregator/types';
+import type { InstrumentDescriptor } from '../InstrumentDescriptor';
+import { MetricStorage } from './MetricStorage';
+import type { MetricData } from '../export/MetricData';
+import { DeltaMetricProcessor } from './DeltaMetricProcessor';
+import { TemporalMetricProcessor } from './TemporalMetricProcessor';
+import type { Maybe } from '../utils';
+import type { MetricCollectorHandle } from './MetricCollector';
+import { AttributeHashMap } from './HashMap';
+import type { AsyncWritableMetricStorage } from './WritableMetricStorage';
+import type { IAttributesProcessor } from '../view/AttributesProcessor';
+
+/**
+ * Internal interface.
+ *
+ * Stores and aggregates {@link MetricData} for asynchronous instruments.
+ */
+export class AsyncMetricStorage<T extends Maybe<Accumulation>>
+  extends MetricStorage
+  implements AsyncWritableMetricStorage
+{
+  private _aggregationCardinalityLimit?: number;
+  private _deltaMetricStorage: DeltaMetricProcessor<T>;
+  private _temporalMetricStorage: TemporalMetricProcessor<T>;
+  private _attributesProcessor?: IAttributesProcessor;
+
+  constructor(
+    _instrumentDescriptor: InstrumentDescriptor,
+    aggregator: Aggregator<T>,
+    attributesProcessor: IAttributesProcessor | undefined,
+    collectorHandles: MetricCollectorHandle[],
+    aggregationCardinalityLimit?: number
+  ) {
+    super(_instrumentDescriptor);
+    this._aggregationCardinalityLimit = aggregationCardinalityLimit;
+    this._deltaMetricStorage = new DeltaMetricProcessor(
+      aggregator,
+      this._aggregationCardinalityLimit
+    );
+    this._temporalMetricStorage = new TemporalMetricProcessor(
+      aggregator,
+      collectorHandles
+    );
+    this._attributesProcessor = attributesProcessor;
+  }
+
+  record(measurements: AttributeHashMap<number>, observationTime: HrTime) {
+    if (this._attributesProcessor === undefined) {
+      this._deltaMetricStorage.batchCumulate(measurements, observationTime);
+      return;
+    }
+    const processed = new AttributeHashMap<number>();
+    for (const [attributes, value] of measurements.entries()) {
+      processed.set(this._attributesProcessor.process(attributes), value);
+    }
+    this._deltaMetricStorage.batchCumulate(processed, observationTime);
+  }
+
+  /**
+   * Collects the metrics from this storage. The ObservableCallback is invoked
+   * during the collection.
+   *
+   * Note: This is a stateful operation and may reset any interval-related
+   * state for the MetricCollector.
+   */
+  collect(
+    collector: MetricCollectorHandle,
+    collectionTime: HrTime
+  ): Maybe<MetricData> {
+    const accumulations = this._deltaMetricStorage.collect();
+
+    return this._temporalMetricStorage.buildMetrics(
+      collector,
+      this._instrumentDescriptor,
+      accumulations,
+      collectionTime
+    );
+  }
+}

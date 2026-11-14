@@ -1,0 +1,170 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import * as api from '@opentelemetry/api';
+import type { Attributes, Context } from '@opentelemetry/api';
+import * as assert from 'assert';
+
+import { SumAggregator } from '../../src/aggregator';
+import { AggregationTemporality } from '../../src/export/AggregationTemporality';
+import { DataPointType } from '../../src/export/MetricData';
+import type { MetricCollectorHandle } from '../../src/state/MetricCollector';
+import { SyncMetricStorage } from '../../src/state/SyncMetricStorage';
+import { createNoopAttributesProcessor } from '../../src/view/AttributesProcessor';
+import {
+  assertMetricData,
+  assertDataPoint,
+  commonAttributes,
+  commonValues,
+  defaultInstrumentDescriptor,
+} from '../util';
+
+const deltaCollector: MetricCollectorHandle = {
+  selectAggregationTemporality: () => AggregationTemporality.DELTA,
+  selectCardinalityLimit: () => 2000,
+};
+
+const cumulativeCollector: MetricCollectorHandle = {
+  selectAggregationTemporality: () => AggregationTemporality.CUMULATIVE,
+  selectCardinalityLimit: () => 2000,
+};
+
+describe('SyncMetricStorage', () => {
+  describe('record', () => {
+    it('no exceptions on record', () => {
+      const metricStorage = new SyncMetricStorage(
+        defaultInstrumentDescriptor,
+        new SumAggregator(true),
+        createNoopAttributesProcessor(),
+        []
+      );
+
+      for (const value of commonValues) {
+        for (const attributes of commonAttributes) {
+          metricStorage.record(value, attributes, api.context.active(), 0);
+        }
+      }
+    });
+  });
+
+  describe('collect', () => {
+    describe('Delta Collector', () => {
+      it('should collect and reset memos', async () => {
+        const metricStorage = new SyncMetricStorage(
+          defaultInstrumentDescriptor,
+          new SumAggregator(true),
+          createNoopAttributesProcessor(),
+          [deltaCollector]
+        );
+
+        metricStorage.record(1, {}, api.context.active(), 0);
+        metricStorage.record(2, {}, api.context.active(), 1000);
+        metricStorage.record(3, {}, api.context.active(), 2000);
+        {
+          const metric = metricStorage.collect(deltaCollector, [3, 3]);
+
+          assertMetricData(metric, DataPointType.SUM);
+          assert.strictEqual(metric.dataPoints.length, 1);
+          assertDataPoint(metric.dataPoints[0], {}, 6, [0, 0], [3, 3]);
+        }
+
+        // The attributes should not be memorized.
+        {
+          const metric = metricStorage.collect(deltaCollector, [4, 4]);
+
+          assert.strictEqual(metric, undefined);
+        }
+
+        metricStorage.record(1, {}, api.context.active(), 5000);
+        {
+          const metric = metricStorage.collect(deltaCollector, [6, 6]);
+
+          assertMetricData(metric, DataPointType.SUM);
+          assert.strictEqual(metric.dataPoints.length, 1);
+          assertDataPoint(metric.dataPoints[0], {}, 1, [5, 0], [6, 6]);
+        }
+      });
+    });
+
+    describe('Cumulative Collector', () => {
+      it('should collect cumulative metrics', async () => {
+        const metricStorage = new SyncMetricStorage(
+          defaultInstrumentDescriptor,
+          new SumAggregator(true),
+          createNoopAttributesProcessor(),
+          [cumulativeCollector]
+        );
+        metricStorage.record(1, {}, api.context.active(), 0);
+        metricStorage.record(2, {}, api.context.active(), 1000);
+        metricStorage.record(3, {}, api.context.active(), 2000);
+        {
+          const metric = metricStorage.collect(cumulativeCollector, [3, 3]);
+
+          assertMetricData(metric, DataPointType.SUM);
+          assert.strictEqual(metric.dataPoints.length, 1);
+          assertDataPoint(metric.dataPoints[0], {}, 6, [0, 0], [3, 3]);
+        }
+
+        // The attributes should be memorized.
+        {
+          const metric = metricStorage.collect(cumulativeCollector, [4, 4]);
+
+          assertMetricData(metric, DataPointType.SUM);
+          assert.strictEqual(metric.dataPoints.length, 1);
+          assertDataPoint(metric.dataPoints[0], {}, 6, [0, 0], [4, 4]);
+        }
+
+        metricStorage.record(1, {}, api.context.active(), 5000);
+        {
+          const metric = metricStorage.collect(cumulativeCollector, [6, 6]);
+
+          assertMetricData(metric, DataPointType.SUM);
+          assert.strictEqual(metric.dataPoints.length, 1);
+          assertDataPoint(metric.dataPoints[0], {}, 7, [0, 0], [6, 6]);
+        }
+      });
+    });
+  });
+
+  describe('attribute processor receives context', () => {
+    it('should pass provided context to attribute processor', () => {
+      const expectedContext = api.ROOT_CONTEXT.setValue(
+        api.createContextKey('test'),
+        'value'
+      );
+      const attributeProcessor = {
+        process(incoming: Attributes, context?: Context) {
+          assert.strictEqual(context, expectedContext);
+          return incoming;
+        },
+      };
+      const metricStorage = new SyncMetricStorage(
+        defaultInstrumentDescriptor,
+        new SumAggregator(true),
+        attributeProcessor,
+        [deltaCollector]
+      );
+
+      metricStorage.record(1, {}, expectedContext, 0);
+    });
+
+    it('should resolve active context when context is undefined', () => {
+      const attributeProcessor = {
+        process(incoming: Attributes, context?: Context) {
+          assert.strictEqual(context, api.context.active());
+          return incoming;
+        },
+      };
+      const metricStorage = new SyncMetricStorage(
+        defaultInstrumentDescriptor,
+        new SumAggregator(true),
+        attributeProcessor,
+        [deltaCollector]
+      );
+
+      metricStorage.record(1, {}, undefined, 0);
+    });
+  });
+});

@@ -1,0 +1,638 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import type { AnyValue, Attributes } from '@opentelemetry/api';
+import { diag } from '@opentelemetry/api';
+import type {
+  ResourceMetrics,
+  MetricData,
+  DataPoint,
+  Histogram,
+} from '@opentelemetry/sdk-metrics';
+import { DataPointType } from '@opentelemetry/sdk-metrics';
+import type { InstrumentationScope } from '@opentelemetry/core';
+import { hrTimeToMilliseconds } from '@opentelemetry/core';
+import type { Resource } from '@opentelemetry/resources';
+import {
+  ATTR_OTEL_SCOPE_NAME,
+  ATTR_OTEL_SCOPE_VERSION,
+} from '@opentelemetry/semantic-conventions';
+
+// This is currently listed as experimental.
+const ATTR_OTEL_SCOPE_SCHEMA_URL = 'otel.scope.schema_url';
+
+type PrometheusDataTypeLiteral =
+  | 'counter'
+  | 'gauge'
+  | 'histogram'
+  | 'summary'
+  | 'untyped';
+
+interface PrometheusMetadata {
+  help: string;
+  unit: string;
+  type: PrometheusDataTypeLiteral;
+}
+
+interface PrometheusMetricFamily {
+  metadata: PrometheusMetadata | undefined;
+  metrics: { metric: MetricData; scope: InstrumentationScope }[];
+}
+
+function createPrometheusMetadata(
+  help: string,
+  unit: string,
+  type: PrometheusDataTypeLiteral
+): PrometheusMetadata {
+  return {
+    help,
+    unit,
+    type,
+  };
+}
+
+function escapeString(str: string) {
+  return str.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
+}
+
+function quoteDiagnosticValue(value: string): string {
+  return JSON.stringify(value);
+}
+
+/**
+ * String Attribute values are converted directly to Prometheus attribute values.
+ * Non-string values are represented as JSON-encoded strings.
+ *
+ * Note: This does *not* currently guard against unserializable attribute
+ * values, e.g. BigInt or circular references. This is relying, as is
+ * the sdk-metrics package, that users follow the requirement to only use
+ * simple attributes. (See OTEP 4485.)
+ */
+function escapeAttributeValue(val: AnyValue = '') {
+  let str: string;
+  if (typeof val !== 'string') {
+    str = JSON.stringify(val);
+  } else {
+    str = val;
+  }
+  return escapeString(str).replace(/"/g, '\\"');
+}
+
+const invalidCharacterRegex = /[^a-z0-9_]/gi;
+const multipleUnderscoreRegex = /_{2,}/g;
+
+/**
+ * Ensures metric names are valid Prometheus metric names by removing
+ * characters allowed by OpenTelemetry but disallowed by Prometheus.
+ *
+ * https://prometheus.io/docs/concepts/data_model/#metric-names-and-attributes
+ *
+ * 1. Names must match `[a-zA-Z_:][a-zA-Z0-9_:]*`
+ *
+ * 2. Colons are reserved for user defined recording rules.
+ * They should not be used by exporters or direct instrumentation.
+ *
+ * OpenTelemetry metric names are already validated in the Meter when they are created,
+ * and they match the format `[a-zA-Z][a-zA-Z0-9_.\-]*` which is very close to a valid
+ * prometheus metric name, so we only need to strip characters valid in OpenTelemetry
+ * but not valid in prometheus and replace them with '_'.
+ *
+ * @param name name to be sanitized
+ */
+function sanitizePrometheusMetricName(name: string): string {
+  // replace all invalid characters with '_'
+  return name
+    .replace(invalidCharacterRegex, '_')
+    .replace(multipleUnderscoreRegex, '_');
+}
+
+/**
+ * @private
+ *
+ * Helper method which assists in enforcing the naming conventions for metric
+ * names in Prometheus
+ * @param name the name of the metric
+ * @param type the kind of metric
+ * @returns string
+ */
+function enforcePrometheusNamingConvention(
+  name: string,
+  data: MetricData
+): string {
+  // Prometheus requires that metrics of the Counter kind have "_total" suffix
+  if (
+    !name.endsWith('_total') &&
+    data.dataPointType === DataPointType.SUM &&
+    data.isMonotonic
+  ) {
+    name = name + '_total';
+  }
+
+  return name;
+}
+
+function valueString(value: number) {
+  if (value === Infinity) {
+    return '+Inf';
+  } else if (value === -Infinity) {
+    return '-Inf';
+  } else {
+    // Handle finite numbers and NaN.
+    return `${value}`;
+  }
+}
+
+function toPrometheusType(metricData: MetricData): PrometheusDataTypeLiteral {
+  switch (metricData.dataPointType) {
+    case DataPointType.SUM:
+      if (metricData.isMonotonic) {
+        return 'counter';
+      }
+      return 'gauge';
+    case DataPointType.GAUGE:
+      return 'gauge';
+    case DataPointType.HISTOGRAM:
+      return 'histogram';
+    default:
+      return 'untyped';
+  }
+}
+
+function stringify(
+  metricName: string,
+  attributes: Attributes,
+  value: number,
+  timestamp?: number,
+  additionalAttributes?: Attributes
+) {
+  let hasAttribute = false;
+  let attributesStr = '';
+
+  for (const [key, val] of Object.entries(attributes)) {
+    const sanitizedAttributeName = sanitizePrometheusMetricName(key);
+    hasAttribute = true;
+    attributesStr += `${
+      attributesStr.length > 0 ? ',' : ''
+    }${sanitizedAttributeName}="${escapeAttributeValue(val)}"`;
+  }
+  if (additionalAttributes) {
+    for (const [key, val] of Object.entries(additionalAttributes)) {
+      const sanitizedAttributeName = sanitizePrometheusMetricName(key);
+      hasAttribute = true;
+      attributesStr += `${
+        attributesStr.length > 0 ? ',' : ''
+      }${sanitizedAttributeName}="${escapeAttributeValue(val)}"`;
+    }
+  }
+
+  if (hasAttribute) {
+    metricName += `{${attributesStr}}`;
+  }
+
+  return `${metricName} ${valueString(value)}${
+    timestamp !== undefined ? ' ' + String(timestamp) : ''
+  }\n`;
+}
+
+const NO_REGISTERED_METRICS = '# no registered metrics';
+
+export class PrometheusSerializer {
+  private _prefix: string | undefined;
+  private _appendTimestamp: boolean;
+  private _additionalAttributes: Attributes | undefined;
+  private _withResourceConstantLabels: RegExp | undefined;
+  private _withoutScopeInfo: boolean | undefined;
+  private _withoutTargetInfo: boolean | undefined;
+  private _previousMetadataConflicts = new Set<string>();
+
+  constructor(
+    prefix?: string,
+    appendTimestamp = false,
+    withResourceConstantLabels?: RegExp,
+    withoutTargetInfo?: boolean,
+    withoutScopeInfo?: boolean
+  ) {
+    if (prefix) {
+      this._prefix = prefix + '_';
+    }
+    this._appendTimestamp = appendTimestamp;
+    this._withResourceConstantLabels = withResourceConstantLabels;
+    this._withoutScopeInfo = !!withoutScopeInfo;
+    this._withoutTargetInfo = !!withoutTargetInfo;
+  }
+
+  serialize(resourceMetrics: ResourceMetrics): string {
+    let str = '';
+    let resource = '';
+    const metricFamilies = this._collectMetricFamilies(resourceMetrics);
+
+    this._additionalAttributes = this._filterResourceConstantLabels(
+      resourceMetrics.resource.attributes,
+      this._withResourceConstantLabels
+    );
+
+    // Preserve first-seen family order, with target_info first, and keep each
+    // family's samples together even when they originate from different scopes.
+    for (const [name, family] of metricFamilies) {
+      if (family.metadata === undefined) {
+        continue;
+      }
+
+      let writeMetadata = true;
+      if (name === 'target_info' && !this._withoutTargetInfo) {
+        resource = this._serializeResource(
+          resourceMetrics.resource,
+          family.metadata,
+          writeMetadata
+        );
+        writeMetadata = false;
+      }
+
+      for (const { metric, scope } of family.metrics) {
+        const metricStr = this._serializeMetricData(
+          metric,
+          scope,
+          name,
+          family.metadata,
+          writeMetadata
+        );
+        if (metricStr) {
+          str += metricStr + '\n';
+          writeMetadata = false;
+        }
+      }
+    }
+
+    if (str === '') {
+      str += NO_REGISTERED_METRICS;
+    }
+
+    return resource + str;
+  }
+
+  private _filterResourceConstantLabels(
+    attributes: Attributes,
+    pattern: RegExp | undefined
+  ) {
+    if (pattern) {
+      const filteredAttributes: Attributes = {};
+      for (const [key, value] of Object.entries(attributes)) {
+        if (key.match(pattern)) {
+          filteredAttributes[key] = value;
+        }
+      }
+      return filteredAttributes;
+    }
+    return;
+  }
+
+  private _warnMetadataConflict(
+    currentMetadataConflicts: Set<string>,
+    kind: 'HELP' | 'UNIT' | 'TYPE',
+    name: string,
+    firstValue: string,
+    secondValue: string,
+    selected: string | undefined
+  ) {
+    const key = `${kind}:${name}:${selected ?? ''}`;
+    if (currentMetadataConflicts.has(key)) {
+      return;
+    }
+    currentMetadataConflicts.add(key);
+    if (this._previousMetadataConflicts.has(key)) {
+      return;
+    }
+
+    const formattedValues = `${quoteDiagnosticValue(
+      firstValue
+    )}, ${quoteDiagnosticValue(secondValue)}`;
+    if (selected === undefined) {
+      diag.warn(
+        `Conflicting ${kind} comments for metric "${name}": ${formattedValues}; dropping the metric.`
+      );
+    } else {
+      diag.warn(
+        `Conflicting ${kind} comments for metric "${name}": ${formattedValues}; exporting ${quoteDiagnosticValue(
+          selected
+        )}.`
+      );
+    }
+  }
+
+  private _collectMetricFamilies(resourceMetrics: ResourceMetrics) {
+    // A TYPE conflict requires dropping the entire family, so all metadata must
+    // be resolved before any samples are serialized.
+    const metricFamilies = new Map<string, PrometheusMetricFamily>();
+    const currentMetadataConflicts = new Set<string>();
+
+    if (!this._withoutTargetInfo) {
+      metricFamilies.set('target_info', {
+        metadata: createPrometheusMetadata('Target metadata', '', 'gauge'),
+        metrics: [],
+      });
+    }
+
+    for (const scopeMetrics of resourceMetrics.scopeMetrics) {
+      for (const metric of scopeMetrics.metrics) {
+        const name = this._getPrometheusMetricName(metric);
+        if (name === undefined) {
+          continue;
+        }
+
+        const type = toPrometheusType(metric);
+        const family = metricFamilies.get(name);
+
+        if (family === undefined) {
+          metricFamilies.set(name, {
+            metadata: createPrometheusMetadata(
+              metric.descriptor.description,
+              metric.descriptor.unit,
+              type
+            ),
+            metrics: [{ metric, scope: scopeMetrics.scope }],
+          });
+          continue;
+        }
+
+        const metadata = family.metadata;
+        if (metadata === undefined) {
+          continue;
+        }
+
+        if (metadata.type !== type) {
+          this._warnMetadataConflict(
+            currentMetadataConflicts,
+            'TYPE',
+            name,
+            metadata.type,
+            type,
+            undefined
+          );
+          family.metadata = undefined;
+          family.metrics = [];
+          continue;
+        }
+
+        family.metrics.push({ metric, scope: scopeMetrics.scope });
+      }
+    }
+
+    for (const [name, family] of metricFamilies) {
+      const metadata = family.metadata;
+      if (metadata === undefined) {
+        continue;
+      }
+
+      for (const { metric } of family.metrics) {
+        const { description: help, unit } = metric.descriptor;
+        if (help) {
+          if (!metadata.help) {
+            metadata.help = help;
+          } else if (metadata.help !== help) {
+            this._warnMetadataConflict(
+              currentMetadataConflicts,
+              'HELP',
+              name,
+              metadata.help,
+              help,
+              metadata.help
+            );
+          }
+        }
+        if (unit) {
+          if (!metadata.unit) {
+            metadata.unit = unit;
+          } else if (metadata.unit !== unit) {
+            this._warnMetadataConflict(
+              currentMetadataConflicts,
+              'UNIT',
+              name,
+              metadata.unit,
+              unit,
+              metadata.unit
+            );
+          }
+        }
+      }
+    }
+
+    // Remember only this scrape's conflicts: persistent conflicts stay quiet,
+    // while resolved conflicts can warn again if they recur later.
+    this._previousMetadataConflicts = currentMetadataConflicts;
+    return metricFamilies;
+  }
+
+  private _serializeMetricData(
+    metricData: MetricData,
+    scope: InstrumentationScope,
+    normalizedName?: string,
+    metadata?: PrometheusMetadata,
+    writeMetadata = true
+  ) {
+    const name = normalizedName ?? this._getPrometheusMetricName(metricData);
+    if (name === undefined) {
+      return '';
+    }
+
+    const currentMetadata =
+      metadata ??
+      createPrometheusMetadata(
+        metricData.descriptor.description,
+        metricData.descriptor.unit,
+        toPrometheusType(metricData)
+      );
+
+    const help = `# HELP ${name} ${escapeString(
+      currentMetadata.help || 'description missing'
+    )}`;
+    const unit = currentMetadata.unit
+      ? `\n# UNIT ${name} ${escapeString(currentMetadata.unit)}`
+      : '';
+    const type = `# TYPE ${name} ${currentMetadata.type}`;
+    const dataPointType = metricData.dataPointType;
+    let additionalAttributes: Attributes | undefined;
+
+    if (this._withoutScopeInfo) {
+      additionalAttributes = this._additionalAttributes;
+    } else {
+      const scopeInfo: Attributes = { [ATTR_OTEL_SCOPE_NAME]: scope.name };
+
+      if (scope.schemaUrl) {
+        scopeInfo[ATTR_OTEL_SCOPE_SCHEMA_URL] = scope.schemaUrl;
+      }
+
+      if (scope.version) {
+        scopeInfo[ATTR_OTEL_SCOPE_VERSION] = scope.version;
+      }
+
+      additionalAttributes = Object.assign(
+        scopeInfo,
+        this._additionalAttributes
+      );
+    }
+
+    let results = '';
+    switch (dataPointType) {
+      case DataPointType.SUM:
+      case DataPointType.GAUGE: {
+        results = metricData.dataPoints
+          .map(it =>
+            this._serializeSingularDataPoint(
+              name,
+              metricData,
+              it,
+              additionalAttributes
+            )
+          )
+          .join('');
+        break;
+      }
+      case DataPointType.HISTOGRAM: {
+        results = metricData.dataPoints
+          .map(it =>
+            this._serializeHistogramDataPoint(
+              name,
+              metricData,
+              it,
+              additionalAttributes
+            )
+          )
+          .join('');
+        break;
+      }
+      default: {
+        diag.error(
+          `Unrecognizable DataPointType: ${dataPointType} for metric "${name}"`
+        );
+      }
+    }
+
+    return `${writeMetadata ? `${help}${unit}\n${type}\n` : ''}${results}`.trim();
+  }
+
+  private _getPrometheusMetricName(metricData: MetricData) {
+    let name = sanitizePrometheusMetricName(
+      escapeString(metricData.descriptor.name)
+    );
+    if (this._prefix) {
+      name = `${this._prefix}${name}`;
+    }
+
+    if (name === '') {
+      diag.error(
+        `Normalization for metric "${metricData.descriptor.name}" resulted in empty name`
+      );
+      return undefined;
+    } else if (name === '_') {
+      diag.error(
+        `Normalization for metric "${metricData.descriptor.name}" resulted in an invalid name: "_"`
+      );
+      return undefined;
+    } else if (name[0] >= '0' && name[0] <= '9') {
+      name = `_${name}`;
+    }
+
+    return enforcePrometheusNamingConvention(name, metricData);
+  }
+
+  private _serializeSingularDataPoint(
+    name: string,
+    data: MetricData,
+    dataPoint: DataPoint<number>,
+    additionalAttributes: Attributes | undefined
+  ): string {
+    let results = '';
+
+    const { value, attributes } = dataPoint;
+    const timestamp = hrTimeToMilliseconds(dataPoint.endTime);
+    results += stringify(
+      name,
+      attributes,
+      value,
+      this._appendTimestamp ? timestamp : undefined,
+      additionalAttributes
+    );
+    return results;
+  }
+
+  private _serializeHistogramDataPoint(
+    name: string,
+    data: MetricData,
+    dataPoint: DataPoint<Histogram>,
+    additionalAttributes: Attributes | undefined
+  ): string {
+    let results = '';
+
+    const attributes = dataPoint.attributes;
+    const histogram = dataPoint.value;
+    const timestamp = hrTimeToMilliseconds(dataPoint.endTime);
+    /** Histogram["bucket"] is not typed with `number` */
+    for (const key of ['count', 'sum'] as ('count' | 'sum')[]) {
+      const value = histogram[key];
+      if (value != null)
+        results += stringify(
+          name + '_' + key,
+          attributes,
+          value,
+          this._appendTimestamp ? timestamp : undefined,
+          additionalAttributes
+        );
+    }
+
+    let cumulativeSum = 0;
+    const countEntries = histogram.buckets.counts.entries();
+    let infiniteBoundaryDefined = false;
+    for (const [idx, val] of countEntries) {
+      cumulativeSum += val;
+      const upperBound = histogram.buckets.boundaries[idx];
+      /** HistogramAggregator is producing different boundary output -
+       * in one case not including infinity values, in other -
+       * full, e.g. [0, 100] and [0, 100, Infinity]
+       * we should consider that in export, if Infinity is defined, use it
+       * as boundary
+       */
+      if (upperBound === undefined && infiniteBoundaryDefined) {
+        break;
+      }
+      if (upperBound === Infinity) {
+        infiniteBoundaryDefined = true;
+      }
+      results += stringify(
+        name + '_bucket',
+        attributes,
+        cumulativeSum,
+        this._appendTimestamp ? timestamp : undefined,
+        Object.assign({}, additionalAttributes, {
+          le:
+            upperBound === undefined || upperBound === Infinity
+              ? '+Inf'
+              : String(upperBound),
+        })
+      );
+    }
+
+    return results;
+  }
+
+  protected _serializeResource(
+    resource: Resource,
+    metadata = createPrometheusMetadata('Target metadata', '', 'gauge'),
+    writeMetadata = true
+  ): string {
+    if (this._withoutTargetInfo === true) {
+      return '';
+    }
+
+    const name = 'target_info';
+    const help = `# HELP ${name} ${escapeString(metadata.help)}`;
+    const unit = metadata.unit
+      ? `\n# UNIT ${name} ${escapeString(metadata.unit)}`
+      : '';
+    const type = `# TYPE ${name} ${metadata.type}`;
+
+    const results = stringify(name, resource.attributes, 1).trim();
+    return `${writeMetadata ? `${help}${unit}\n${type}\n` : ''}${results}\n`;
+  }
+}

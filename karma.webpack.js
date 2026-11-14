@@ -1,0 +1,82 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+const path = require('path');
+const webpack = require('webpack')
+
+// This is the webpack configuration for browser Karma tests with coverage.
+module.exports = {
+  mode: 'development',
+  target: 'web',
+  output: {filename: 'bundle.js'},
+  resolve: {
+    extensions: ['.ts', '.js'],
+    fallback: {
+      // Enable the assert library polyfill because that is used in tests
+      "assert": require.resolve('assert/'),
+      "util": require.resolve('util/'),
+      // Only node-only platform code uses `path`; browser code paths never reach
+      // it. If that breaks: `TypeError: path.normalize is not a function`.
+      "path": false,
+    },
+  },
+  devtool: 'eval-source-map',
+  plugins: [
+    new webpack.ProvidePlugin({
+      // Not a global: only modules with a free `process` (such as util) get
+      // it. Absolute, since isolated installs hide `process` from those modules.
+      process: require.resolve('process/browser.js')
+    }),
+    // Benchmark.js checks for AMD's define function which doesn't exist in webpack.
+    // NOTE: This pollutes tests with a defined 'self.define' global.
+    new webpack.BannerPlugin({
+      banner: 'self.define = self.define || Object.assign(function(){}, {amd: false});',
+      raw: true
+    })
+  ],
+  module: {
+    rules: [
+      {
+        // #platform resolves to src for the package under test only; dependencies
+        // keep their dist, as a global condition would resolve them to their src too.
+        include: path.resolve('src'),
+        resolve: { conditionNames: ['otel', '...'] },
+      },
+      {
+        test: /\.ts$/,
+        // transpileOnly: tsconfig.base.json sets `composite` but we never run
+        // `tsc -b`, so no `.tsbuildinfo` exists; ts-loader's default mode wants one.
+        use: { loader: 'ts-loader', options: { transpileOnly: true } },
+      },
+      {
+        test: /\.js$/,
+        exclude: {
+          and: [/node_modules/], // Exclude libraries in node_modules ...
+          not: [
+            // Except for a few of them that needs to be transpiled because they use modern syntax
+            /zone.js/,
+          ],
+        },
+        use: {
+          loader: 'babel-loader',
+          options: {
+            presets: ['@babel/preset-env'],
+          }
+        },
+      },
+      {
+        enforce: 'post',
+        exclude: /(node_modules|\.test\.[tj]sx?$)/,
+        test: /\.ts$/,
+        use: {
+          loader: 'babel-loader',
+          options: {
+            plugins: ['babel-plugin-istanbul'],
+          }
+        },
+      },
+    ],
+  },
+};

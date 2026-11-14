@@ -1,0 +1,498 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import type {
+  ContextManager,
+  MeterProvider,
+  TextMapPropagator,
+} from '@opentelemetry/api';
+import { context, diag, propagation } from '@opentelemetry/api';
+import {
+  CompositePropagator,
+  getNumberFromEnv,
+  getStringFromEnv,
+  getStringListFromEnv,
+  W3CBaggagePropagator,
+  W3CTraceContextPropagator,
+} from '@opentelemetry/core';
+import { OTLPTraceExporter as OTLPProtoTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
+import { OTLPTraceExporter as OTLPHttpTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import { OTLPTraceExporter as OTLPGrpcTraceExporter } from '@opentelemetry/exporter-trace-otlp-grpc';
+import { ZipkinExporter } from '@opentelemetry/exporter-zipkin';
+import type { ResourceDetector } from '@opentelemetry/resources';
+import {
+  envDetector,
+  hostDetector,
+  osDetector,
+  processDetector,
+  serviceInstanceIdDetector,
+} from '@opentelemetry/resources';
+import type { SpanExporter, SpanProcessor } from '@opentelemetry/sdk-trace';
+import {
+  ConsoleSpanExporter,
+  SimpleSpanProcessor,
+} from '@opentelemetry/sdk-trace';
+import { B3InjectEncoding, B3Propagator } from '@opentelemetry/propagator-b3';
+import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
+import type { ConfigurationModel } from '@opentelemetry/configuration';
+import type {
+  IMetricReader,
+  PushMetricExporter,
+} from '@opentelemetry/sdk-metrics';
+import {
+  ConsoleMetricExporter,
+  PeriodicExportingMetricReader,
+} from '@opentelemetry/sdk-metrics';
+import { OTLPMetricExporter as OTLPGrpcMetricExporter } from '@opentelemetry/exporter-metrics-otlp-grpc';
+import { OTLPMetricExporter as OTLPHttpMetricExporter } from '@opentelemetry/exporter-metrics-otlp-http';
+import { OTLPMetricExporter as OTLPProtoMetricExporter } from '@opentelemetry/exporter-metrics-otlp-proto';
+import { PrometheusExporter } from '@opentelemetry/exporter-prometheus';
+import type {
+  BatchLogRecordProcessorOptions,
+  LogRecordExporter,
+  LoggerProviderOptions,
+} from '@opentelemetry/sdk-logs';
+import { BatchLogRecordProcessor } from '@opentelemetry/sdk-logs';
+import { createBatchSpanProcessorFromEnv } from './create-from-env';
+
+const RESOURCE_DETECTOR_ENVIRONMENT = 'env';
+const RESOURCE_DETECTOR_HOST = 'host';
+const RESOURCE_DETECTOR_OS = 'os';
+const RESOURCE_DETECTOR_PROCESS = 'process';
+const RESOURCE_DETECTOR_SERVICE_INSTANCE_ID = 'serviceinstance';
+
+export function getResourceDetectorsFromEnv(): Array<ResourceDetector> {
+  // When updating this list, make sure to also update the section `resourceDetectors` on README.
+  const resourceDetectors = new Map<string, ResourceDetector>([
+    [RESOURCE_DETECTOR_HOST, hostDetector],
+    [RESOURCE_DETECTOR_OS, osDetector],
+    [RESOURCE_DETECTOR_SERVICE_INSTANCE_ID, serviceInstanceIdDetector],
+    [RESOURCE_DETECTOR_PROCESS, processDetector],
+    [RESOURCE_DETECTOR_ENVIRONMENT, envDetector],
+  ]);
+
+  const resourceDetectorsFromEnv = getStringListFromEnv(
+    'OTEL_NODE_RESOURCE_DETECTORS'
+  ) ?? ['all'];
+
+  if (resourceDetectorsFromEnv.includes('all')) {
+    return [...resourceDetectors.values()].flat();
+  }
+
+  if (resourceDetectorsFromEnv.includes('none')) {
+    return [];
+  }
+
+  return resourceDetectorsFromEnv.flatMap(detector => {
+    const resourceDetector = resourceDetectors.get(detector);
+    if (!resourceDetector) {
+      diag.warn(
+        `Invalid resource detector "${detector}" specified in the environment variable OTEL_NODE_RESOURCE_DETECTORS`
+      );
+    }
+    return resourceDetector || [];
+  });
+}
+
+export function getOtlpProtocolFromEnv(): string {
+  return (
+    getStringFromEnv('OTEL_EXPORTER_OTLP_TRACES_PROTOCOL') ??
+    getStringFromEnv('OTEL_EXPORTER_OTLP_PROTOCOL') ??
+    'http/protobuf'
+  );
+}
+
+function getOtlpExporterFromEnv(): SpanExporter {
+  const protocol = getOtlpProtocolFromEnv();
+
+  switch (protocol) {
+    case 'grpc':
+      return new OTLPGrpcTraceExporter();
+    case 'http/json':
+      return new OTLPHttpTraceExporter();
+    case 'http/protobuf':
+      return new OTLPProtoTraceExporter();
+    default:
+      diag.warn(
+        `Unsupported OTLP traces protocol: ${protocol}. Using http/protobuf.`
+      );
+      return new OTLPProtoTraceExporter();
+  }
+}
+
+export function getSpanProcessorsFromEnv(
+  selfObsMeterProvider: MeterProvider | undefined
+): SpanProcessor[] {
+  const exportersMap = new Map<string, () => SpanExporter>([
+    ['otlp', () => getOtlpExporterFromEnv()],
+    ['zipkin', () => new ZipkinExporter()],
+    ['console', () => new ConsoleSpanExporter()],
+  ]);
+  const exporters: SpanExporter[] = [];
+  const processors: SpanProcessor[] = [];
+  let traceExportersList = Array.from(
+    new Set(getStringListFromEnv('OTEL_TRACES_EXPORTER'))
+  ).filter(s => s !== 'null');
+
+  if (traceExportersList[0] === 'none') {
+    diag.warn(
+      'OTEL_TRACES_EXPORTER contains "none". SDK will not be initialized.'
+    );
+    return [];
+  }
+
+  if (traceExportersList.length === 0) {
+    diag.debug('OTEL_TRACES_EXPORTER is empty. Using default otlp exporter.');
+    traceExportersList = ['otlp'];
+  } else if (
+    traceExportersList.length > 1 &&
+    traceExportersList.includes('none')
+  ) {
+    diag.warn(
+      'OTEL_TRACES_EXPORTER contains "none" along with other exporters. Using default otlp exporter.'
+    );
+    traceExportersList = ['otlp'];
+  }
+
+  for (const name of traceExportersList) {
+    const exporter = exportersMap.get(name)?.();
+    if (exporter) {
+      exporters.push(exporter);
+    } else {
+      diag.warn(`Unrecognized OTEL_TRACES_EXPORTER value: ${name}.`);
+    }
+  }
+
+  for (const exp of exporters) {
+    if (exp instanceof ConsoleSpanExporter) {
+      processors.push(
+        new SimpleSpanProcessor({ exporter: exp, selfObsMeterProvider })
+      );
+    } else {
+      processors.push(
+        createBatchSpanProcessorFromEnv(exp, selfObsMeterProvider)
+      );
+    }
+  }
+
+  if (exporters.length === 0) {
+    diag.warn(
+      'Unable to set up trace exporter(s) due to invalid exporter and/or protocol values.'
+    );
+  }
+
+  return processors;
+}
+
+/**
+ * Get a propagator as defined by environment variables
+ */
+export function getPropagatorFromEnv(): TextMapPropagator | null | undefined {
+  // Empty and undefined MUST be treated equal.
+  const propagatorsEnvVarValue = getStringListFromEnv('OTEL_PROPAGATORS');
+  if (propagatorsEnvVarValue == null) {
+    // return undefined to fall back to default
+    return undefined;
+  }
+
+  if (propagatorsEnvVarValue.includes('none')) {
+    return null;
+  }
+
+  // Implementation note: this only contains specification required propagators that are actually hosted in this repo.
+  // Any other propagators (like aws, aws-lambda, should go into `@opentelemetry/auto-configuration-propagators` instead).
+  const propagatorsFactory = new Map<string, () => TextMapPropagator>([
+    ['tracecontext', () => new W3CTraceContextPropagator()],
+    ['baggage', () => new W3CBaggagePropagator()],
+    ['b3', () => new B3Propagator()],
+    [
+      'b3multi',
+      () => new B3Propagator({ injectEncoding: B3InjectEncoding.MULTI_HEADER }),
+    ],
+  ]);
+
+  // Values MUST be deduplicated in order to register a Propagator only once.
+  const uniquePropagatorNames = Array.from(new Set(propagatorsEnvVarValue));
+  const validPropagators: TextMapPropagator[] = [];
+
+  uniquePropagatorNames.forEach(name => {
+    const propagator = propagatorsFactory.get(name)?.();
+    if (!propagator) {
+      diag.warn(
+        `Propagator "${name}" requested through environment variable is unavailable.`
+      );
+      return;
+    }
+
+    validPropagators.push(propagator);
+  });
+
+  if (validPropagators.length === 0) {
+    // null to signal that the default should **not** be used in its place.
+    return null;
+  } else if (uniquePropagatorNames.length === 1) {
+    return validPropagators[0];
+  } else {
+    return new CompositePropagator({
+      propagators: validPropagators,
+    });
+  }
+}
+
+export function setupContextManager(
+  contextManager: ContextManager | null | undefined
+) {
+  // null means 'do not register'
+  if (contextManager === null) {
+    return;
+  }
+
+  // undefined means 'register default'
+  if (contextManager === undefined) {
+    const defaultContextManager = new AsyncLocalStorageContextManager();
+    defaultContextManager.enable();
+    context.setGlobalContextManager(defaultContextManager);
+    return;
+  }
+
+  contextManager.enable();
+  context.setGlobalContextManager(contextManager);
+}
+
+export function setupPropagator(
+  propagator: TextMapPropagator | null | undefined
+) {
+  // null means 'do not register'
+  if (propagator === null) {
+    return;
+  }
+
+  // undefined means 'register default'
+  if (propagator === undefined) {
+    propagation.setGlobalPropagator(
+      new CompositePropagator({
+        propagators: [
+          new W3CTraceContextPropagator(),
+          new W3CBaggagePropagator(),
+        ],
+      })
+    );
+    return;
+  }
+
+  propagation.setGlobalPropagator(propagator);
+}
+
+export function getKeyListFromObjectArray(
+  obj: object[] | undefined
+): string[] | undefined {
+  if (!obj || obj.length === 0) {
+    return undefined;
+  }
+
+  const keys: string[] = [];
+  for (const item of obj) {
+    for (const key of Object.keys(item)) {
+      keys.push(key);
+    }
+  }
+  return keys;
+}
+
+export function getNonNegativeNumberFromEnv(
+  envVarName: string
+): number | undefined {
+  const value = getNumberFromEnv(envVarName);
+  if (value != null && value <= 0) {
+    diag.warn(
+      `${envVarName} (${value}) is invalid, expected number greater than 0, using default.`
+    );
+    return undefined;
+  }
+  return value;
+}
+
+export function getPeriodicExportingMetricReaderFromEnv(
+  exporter: PushMetricExporter
+): IMetricReader {
+  const defaultTimeoutMillis = 30_000;
+  const defaultIntervalMillis = 60_000;
+
+  const rawExportIntervalMillis = getNonNegativeNumberFromEnv(
+    'OTEL_METRIC_EXPORT_INTERVAL'
+  );
+  const rawExportTimeoutMillis = getNonNegativeNumberFromEnv(
+    'OTEL_METRIC_EXPORT_TIMEOUT'
+  );
+
+  // Apply defaults
+  const exportIntervalMillis = rawExportIntervalMillis ?? defaultIntervalMillis;
+  let exportTimeoutMillis = rawExportTimeoutMillis ?? defaultTimeoutMillis;
+
+  // Ensure timeout doesn't exceed interval
+  if (exportTimeoutMillis > exportIntervalMillis) {
+    // determine which env vars were set and which ones defaulted for logging purposes
+    const timeoutSource =
+      rawExportTimeoutMillis != null
+        ? rawExportTimeoutMillis.toString()
+        : `${defaultTimeoutMillis}, default`;
+    const intervalSource =
+      rawExportIntervalMillis != null
+        ? rawExportIntervalMillis.toString()
+        : `${defaultIntervalMillis}, default`;
+
+    const bothSetByUser =
+      rawExportTimeoutMillis != null && rawExportIntervalMillis != null;
+    const logMessage = `OTEL_METRIC_EXPORT_TIMEOUT (${timeoutSource}) is greater than OTEL_METRIC_EXPORT_INTERVAL (${intervalSource}). Clamping timeout to interval value.`;
+
+    // only bother users if they explicitly set both values.
+    if (bothSetByUser) {
+      diag.warn(logMessage);
+    } else {
+      diag.info(logMessage);
+    }
+
+    exportTimeoutMillis = exportIntervalMillis;
+  }
+
+  return new PeriodicExportingMetricReader({
+    exportTimeoutMillis,
+    exportIntervalMillis,
+    exporter,
+  });
+}
+
+export function getOtlpMetricExporterFromEnv(): PushMetricExporter {
+  const protocol =
+    (
+      getStringFromEnv('OTEL_EXPORTER_OTLP_METRICS_PROTOCOL') ??
+      getStringFromEnv('OTEL_EXPORTER_OTLP_PROTOCOL')
+    )?.trim() || 'http/protobuf'; // Using || to also fall back on empty string
+
+  switch (protocol) {
+    case 'grpc':
+      return new OTLPGrpcMetricExporter();
+    case 'http/json':
+      return new OTLPHttpMetricExporter();
+    case 'http/protobuf':
+      return new OTLPProtoMetricExporter();
+  }
+
+  diag.warn(
+    `Unsupported OTLP metrics protocol: "${protocol}". Using http/protobuf.`
+  );
+  return new OTLPProtoMetricExporter();
+}
+
+/**
+ *
+ * @returns MetricReader[] if appropriate environment variables are configured
+ */
+export function getMetricReadersFromEnv(): IMetricReader[] {
+  const metricReaders: IMetricReader[] = [];
+  const enabledExporters = Array.from(
+    new Set(getStringListFromEnv('OTEL_METRICS_EXPORTER') ?? [])
+  );
+
+  if (enabledExporters.length === 0) {
+    diag.debug('OTEL_METRICS_EXPORTER is empty. Using default otlp exporter.');
+    enabledExporters.push('otlp');
+  }
+
+  if (enabledExporters.includes('none')) {
+    diag.info(
+      'OTEL_METRICS_EXPORTER contains "none". Metric provider will not be initialized.'
+    );
+    return metricReaders;
+  }
+
+  enabledExporters.forEach(exporter => {
+    if (exporter === 'otlp') {
+      metricReaders.push(
+        getPeriodicExportingMetricReaderFromEnv(getOtlpMetricExporterFromEnv())
+      );
+    } else if (exporter === 'console') {
+      metricReaders.push(
+        new PeriodicExportingMetricReader({
+          exporter: new ConsoleMetricExporter(),
+        })
+      );
+    } else if (exporter === 'prometheus') {
+      metricReaders.push(
+        new PrometheusExporter({
+          host: getStringFromEnv('OTEL_EXPORTER_PROMETHEUS_HOST'),
+          port: getNumberFromEnv('OTEL_EXPORTER_PROMETHEUS_PORT'),
+        })
+      );
+    } else {
+      diag.warn(
+        `Unsupported OTEL_METRICS_EXPORTER value: "${exporter}". Supported values are: otlp, console, prometheus, none.`
+      );
+    }
+  });
+
+  return metricReaders;
+}
+
+/**
+ * Get LoggerProviderConfig from environment variables.
+ */
+export function getLoggerProviderConfigFromEnv(): LoggerProviderOptions {
+  return {
+    logRecordLimits: {
+      attributeCountLimit:
+        getNonNegativeNumberFromEnv('OTEL_LOGRECORD_ATTRIBUTE_COUNT_LIMIT') ??
+        getNonNegativeNumberFromEnv('OTEL_ATTRIBUTE_COUNT_LIMIT'),
+      attributeValueLengthLimit:
+        getNonNegativeNumberFromEnv(
+          'OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT'
+        ) ?? getNonNegativeNumberFromEnv('OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT'),
+    },
+  };
+}
+
+/**
+ * Get configuration for BatchLogRecordProcessor from environment variables.
+ */
+export function getBatchLogRecordProcessorConfigFromEnv(): Omit<
+  BatchLogRecordProcessorOptions,
+  'exporter'
+> {
+  return {
+    maxQueueSize: getNonNegativeNumberFromEnv('OTEL_BLRP_MAX_QUEUE_SIZE'),
+    scheduledDelayMillis: getNonNegativeNumberFromEnv(
+      'OTEL_BLRP_SCHEDULE_DELAY'
+    ),
+    exportTimeoutMillis: getNonNegativeNumberFromEnv(
+      'OTEL_BLRP_EXPORT_TIMEOUT'
+    ),
+    maxExportBatchSize: getNonNegativeNumberFromEnv(
+      'OTEL_BLRP_MAX_EXPORT_BATCH_SIZE'
+    ),
+  };
+}
+
+export function getBatchLogRecordProcessorFromEnv(
+  exporter: LogRecordExporter,
+  selfObsMeterProvider: MeterProvider | undefined
+): BatchLogRecordProcessor {
+  return new BatchLogRecordProcessor({
+    exporter,
+    selfObsMeterProvider,
+    ...getBatchLogRecordProcessorConfigFromEnv(),
+  });
+}
+
+export function getInstanceID(config: ConfigurationModel): string | undefined {
+  if (config.resource?.attributes) {
+    for (let i = 0; i < config.resource.attributes.length; i++) {
+      const element = config.resource.attributes[i];
+      if (element.name === 'service.instance.id') {
+        return element.value?.toString();
+      }
+    }
+  }
+  return undefined;
+}
