@@ -1,0 +1,59 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import type { TracerProvider, MeterProvider } from '@opentelemetry/api';
+import type { Instrumentation } from './types';
+import type { LoggerProvider } from '@opentelemetry/api';
+import type { ConfigProvider } from '@opentelemetry/api-config';
+
+/**
+ * Enable instrumentations
+ * @param instrumentations
+ * @param tracerProvider
+ * @param meterProvider
+ */
+export function enableInstrumentations(
+  instrumentations: Instrumentation[],
+  tracerProvider?: TracerProvider,
+  meterProvider?: MeterProvider,
+  loggerProvider?: LoggerProvider,
+  configProvider?: ConfigProvider
+): void {
+  for (let i = 0, j = instrumentations.length; i < j; i++) {
+    const instrumentation = instrumentations[i];
+    if (configProvider && instrumentation.setConfigProvider) {
+      // Setting ConfigProvider before others, because theoretically config
+      // could impact usage of the other providers, e.g. which metric
+      // instruments are setup in `_updateMetricInstruments()`.
+      instrumentation.setConfigProvider(configProvider);
+    }
+    if (tracerProvider) {
+      instrumentation.setTracerProvider(tracerProvider);
+    }
+    if (meterProvider) {
+      instrumentation.setMeterProvider(meterProvider);
+    }
+    if (loggerProvider && instrumentation.setLoggerProvider) {
+      instrumentation.setLoggerProvider(loggerProvider);
+    }
+    // instrumentations have been already enabled during creation
+    // so enable only if user prevented that by setting enabled to false
+    // this is to prevent double enabling but when calling register all
+    // instrumentations should be now enabled
+    if (!instrumentation.getConfig().enabled) {
+      instrumentation.enable();
+    }
+  }
+}
+
+/**
+ * Disable instrumentations
+ * @param instrumentations
+ */
+export function disableInstrumentations(
+  instrumentations: Instrumentation[]
+): void {
+  instrumentations.forEach(instrumentation => instrumentation.disable());
+}

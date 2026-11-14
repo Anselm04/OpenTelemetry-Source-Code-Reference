@@ -1,0 +1,39 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace';
+import type { OTLPExporterNodeConfigBase } from '@opentelemetry/otlp-exporter-base/node-http';
+import { OTLPExporterBase } from '@opentelemetry/otlp-exporter-base';
+import {
+  ProtobufTraceSerializer,
+  TraceExporterMetricsHelper,
+} from '@opentelemetry/otlp-transformer';
+import {
+  createOtlpHttpExportDelegate,
+  convertLegacyHttpOptions,
+} from '@opentelemetry/otlp-exporter-base/node-http';
+import { OTEL_COMPONENT_TYPE_VALUE_OTLP_HTTP_SPAN_EXPORTER } from '../../semconv';
+
+/**
+ * Collector Trace Exporter for Node with protobuf
+ */
+export class OTLPTraceExporter
+  extends OTLPExporterBase<ReadableSpan[]>
+  implements SpanExporter
+{
+  constructor(config: OTLPExporterNodeConfigBase = {}) {
+    super(
+      createOtlpHttpExportDelegate(
+        convertLegacyHttpOptions(config, 'TRACES', 'v1/traces', {
+          'Content-Type': 'application/x-protobuf',
+        }),
+        ProtobufTraceSerializer,
+        OTEL_COMPONENT_TYPE_VALUE_OTLP_HTTP_SPAN_EXPORTER,
+        TraceExporterMetricsHelper,
+        config.selfObsMeterProvider
+      )
+    );
+  }
+}

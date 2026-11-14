@@ -1,0 +1,84 @@
+name: SBOM
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  generate-sboms:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ^26.3.0
+          # Disable caching in release workflows (https://docs.zizmor.sh/audits/#cache-poisoning).
+          # Zizmor didn't actually warn about this, but its general advice
+          # was to avoid caching in workflows that publish artifacts. While
+          # the published SBOM.zip does not include executable code, it is
+          # still a published artifact.
+          package-manager-cache: false
+
+      - name: Bootstrap
+        run: npm ci --ignore-scripts
+
+      - name: Generate SBOM for core packages
+        if: ${{ ! startsWith(github.ref, 'refs/tags/experimental') && ! startsWith(github.ref, 'refs/tags/api') }}
+        run: |
+          for dir in $(find packages -mindepth 1 -maxdepth 1 -type d)
+          do
+            dir_name=$(basename "$dir")
+            echo "Generating SBOM for $dir_name"
+            npm sbom --sbom-format=spdx --legacy-peer-deps --workspace ${dir} > "opentelemetry-js_${dir_name}.spdx.json"
+          done
+
+      - name: Generate SBOM for the API package
+        if: startsWith(github.ref, 'refs/tags/api/')
+        run: |
+          npm sbom --sbom-format=spdx --legacy-peer-deps --workspace api > opentelemetry-js_api.spdx.json
+
+      - name: Generate SBOMs for experimental packages
+        if: startsWith(github.ref, 'refs/tags/experimental/')
+        run: |
+          for dir in $(find experimental/packages -mindepth 1 -maxdepth 1 -type d)
+          do
+            dir_name=$(basename "$dir")
+            echo "Generating SBOM for $dir_name"
+            npm sbom --sbom-format=spdx --legacy-peer-deps --workspace ${dir} > "opentelemetry-js_${dir_name}.spdx.json"
+          done
+
+      - name: Zip all SBOM files
+        run: |
+          zip sbom.zip *.spdx.json
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          archive: false
+          path: ./sbom.zip
+
+  add-release-artifact:
+    needs: generate-sboms
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact from generate-sboms
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom.zip
+          skip-decompress: true
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          mv sbom.zip SBOM.zip
+          gh release upload "$TAG" ./SBOM.zip --clobber

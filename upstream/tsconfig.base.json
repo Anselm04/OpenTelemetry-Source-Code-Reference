@@ -1,0 +1,40 @@
+{
+  "compilerOptions": {
+    "allowUnreachableCode": false,
+    "allowUnusedLabels": false,
+    "composite": true,
+    // Picks the otel branch of #platform, so a package's own src resolves it without a build.
+    "customConditions": ["otel"],
+    "declaration": true,
+    "declarationMap": true,
+    "forceConsistentCasingInFileNames": true,
+    "incremental": true,
+    "inlineSources": true,
+    "isolatedModules": true,
+    "module": "node16",
+    "moduleResolution": "node16",
+    "esModuleInterop": false,
+    "newLine": "LF",
+    "noEmitOnError": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "pretty": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "strict": true,
+    "strictNullChecks": true,
+    "target": "es2022",
+    // The types used by most workspaces. A workspace that requires more can
+    // add its own.
+    "types": ["node", "mocha", "webpack-env"],
+    "useUnknownInCatchVariables": false,
+    "lib": [
+      "es2022"
+    ]
+  },
+  "exclude": [
+    "node_modules"
+  ]
+}

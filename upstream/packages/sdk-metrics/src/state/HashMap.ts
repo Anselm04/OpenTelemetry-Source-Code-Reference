@@ -1,0 +1,85 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import type { Attributes } from '@opentelemetry/api';
+import { hashAttributes } from '../utils';
+
+export interface Hash<ValueType, HashCodeType> {
+  (value: ValueType): HashCodeType;
+}
+
+export class HashMap<KeyType, ValueType, HashCodeType> {
+  private _valueMap = new Map<HashCodeType, ValueType>();
+  private _keyMap = new Map<HashCodeType, KeyType>();
+  private _hash;
+
+  constructor(hash: Hash<KeyType, HashCodeType>) {
+    this._hash = hash;
+  }
+
+  get(key: KeyType, hashCode?: HashCodeType) {
+    hashCode ??= this._hash(key);
+    return this._valueMap.get(hashCode);
+  }
+
+  getOrDefault(key: KeyType, defaultFactory: () => ValueType) {
+    const hash = this._hash(key);
+    if (this._valueMap.has(hash)) {
+      return this._valueMap.get(hash);
+    }
+    const val = defaultFactory();
+    if (!this._keyMap.has(hash)) {
+      this._keyMap.set(hash, key);
+    }
+    this._valueMap.set(hash, val);
+    return val;
+  }
+
+  set(key: KeyType, value: ValueType, hashCode?: HashCodeType) {
+    hashCode ??= this._hash(key);
+    if (!this._keyMap.has(hashCode)) {
+      this._keyMap.set(hashCode, key);
+    }
+    this._valueMap.set(hashCode, value);
+  }
+
+  has(key: KeyType, hashCode?: HashCodeType) {
+    hashCode ??= this._hash(key);
+    return this._valueMap.has(hashCode);
+  }
+
+  *keys(): IterableIterator<[KeyType, HashCodeType]> {
+    const keyIterator = this._keyMap.entries();
+    let next = keyIterator.next();
+    while (next.done !== true) {
+      yield [next.value[1], next.value[0]];
+      next = keyIterator.next();
+    }
+  }
+
+  *entries(): IterableIterator<[KeyType, ValueType, HashCodeType]> {
+    const valueIterator = this._valueMap.entries();
+    let next = valueIterator.next();
+    while (next.done !== true) {
+      // next.value[0] here can not be undefined
+      yield [this._keyMap.get(next.value[0])!, next.value[1], next.value[0]];
+      next = valueIterator.next();
+    }
+  }
+
+  get size() {
+    return this._valueMap.size;
+  }
+}
+
+export class AttributeHashMap<ValueType> extends HashMap<
+  Attributes,
+  ValueType,
+  string
+> {
+  constructor() {
+    super(hashAttributes);
+  }
+}
