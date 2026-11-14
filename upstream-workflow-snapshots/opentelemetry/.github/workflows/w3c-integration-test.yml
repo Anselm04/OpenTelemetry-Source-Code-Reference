@@ -1,0 +1,38 @@
+name: W3C Trace Context Integration Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 🛎️
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+          node-version: ^26.3.0
+
+      - name: Install and Bootstrap 🔧
+        run: npm ci --ignore-scripts
+
+      # validation-server.js is plain JS that requires built @opentelemetry/*
+      # packages
+      - name: Build 🔧
+        run: npm run compile
+
+      - name: Run W3C Test harness
+        run: ./integration-tests/tracecontext-integration-test.sh

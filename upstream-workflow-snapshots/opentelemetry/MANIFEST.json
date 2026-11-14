@@ -1,0 +1,134 @@
+{
+  "source": "https://github.com/open-telemetry/opentelemetry-js.git",
+  "commit": "5a78e6aef1fcbbe8306d982c0b3f0f1ea57eb032",
+  "number_of_original_workflow_files": 21,
+  "original_ci_is_disabled": true,
+  "files": [
+    {
+      "upstream_path": ".github/workflows/backcompat.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/backcompat.yml",
+      "git_blob": "986fe5bf164687939e64d777915e2f92ccbeb775",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/benchmark.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/benchmark.yml",
+      "git_blob": "5a0817c4b981173fb992184f0c9756cb5d1d6bc6",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/bundler-tests.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/bundler-tests.yml",
+      "git_blob": "aaa0c5042f627242d7898225d2fad2cf0acb6d21",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/changelog.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/changelog.yml",
+      "git_blob": "f7c6c29b449a514e45cfa627aa3df37b85d7e092",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/close-stale.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/close-stale.yml",
+      "git_blob": "7da23f540f8f7f1ba088d9ce609ad652991b40dd",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/codeql-analysis.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/codeql-analysis.yml",
+      "git_blob": "cf6c708074f78bff3976c453436cb8d98999730e",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/create-or-update-release-pr.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/create-or-update-release-pr.yml",
+      "git_blob": "07d5980811993cb6747201b099623f3475be5157",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/docs-test.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/docs-test.yml",
+      "git_blob": "56a224089961531681efc3a35bab908b14336b36",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/docs.yaml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/docs.yaml",
+      "git_blob": "5a4e1813332384358d36cd93dec83074be78ed64",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/e2e.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/e2e.yml",
+      "git_blob": "e91344131bc6448f6f81227be5780e6e02a86a03",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/first-time-pr.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/first-time-pr.yml",
+      "git_blob": "4155039b2067c276321ff34a7f4de91ba2365f36",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/fossa.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/fossa.yml",
+      "git_blob": "8c1cdb05425a526cb8b0f7e70c1114ca758d9ec8",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/lint.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/lint.yml",
+      "git_blob": "12dc54c89f8b6cca110e179552dada78b8a6208b",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/ossf-scorecard.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/ossf-scorecard.yml",
+      "git_blob": "a8cf1e8c31703b00086f40a539fd89679d0ca130",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/peer-api.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/peer-api.yml",
+      "git_blob": "92685dc9fd8202790c6d5e67cbdddc615c370ed6",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/publish-to-npm.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/publish-to-npm.yml",
+      "git_blob": "ae961fdfba36b2727d9164679452342f0f47a0f5",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/sbom.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/sbom.yml",
+      "git_blob": "9faf69e46b3a3d64ac028663fbd7a2adb88b4d61",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/survey-on-merged-pr.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/survey-on-merged-pr.yml",
+      "git_blob": "cb8f869c1ab44f45aff33113421bc02fc5f72399",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/unit-test.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/unit-test.yml",
+      "git_blob": "599e4384b40a523b3bb3fb4a2c56bf0e64e69485",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/w3c-integration-test.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/w3c-integration-test.yml",
+      "git_blob": "ff6dd9c30d529e9d4ec71f24830442a07c0c070b",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/zizmor-check.yml",
+      "reference_path": "upstream-workflow-snapshots/opentelemetry/.github/workflows/zizmor-check.yml",
+      "git_blob": "b2d7cc520fcc04b53397557b1f6a6f07aa781a75",
+      "original_mode": "100644"
+    }
+  ]
+}
